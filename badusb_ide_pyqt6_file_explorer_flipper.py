@@ -622,6 +622,188 @@ class OllamaWorker(QThread):
         except Exception as ex:
             self.finished_text.emit('', f'{type(ex).__name__}: {ex}')
 
+class GitManagerDialog(QDialog):
+    """GUI for Git repositories; private-repository auth uses Git Credential Manager or SSH."""
+    def __init__(self, ide):
+        super().__init__(ide)
+        self.ide = ide
+        self.repo_path = None
+        self.setWindowTitle("Git · Repository-Verwaltung")
+        self.resize(760, 590)
+        root = QVBoxLayout(self)
+        form = QFormLayout()
+        self.repo_edit = QLineEdit()
+        self.repo_edit.setPlaceholderText("Lokaler Repository-Ordner")
+        browse = QPushButton("Ordner…")
+        browse.clicked.connect(self.choose_repo)
+        repo_row = QHBoxLayout(); repo_row.addWidget(self.repo_edit, 1); repo_row.addWidget(browse)
+        repo_wrap = QWidget(); repo_wrap.setLayout(repo_row)
+        form.addRow("Repository", repo_wrap)
+        self.remote_edit = QLineEdit()
+        self.remote_edit.setPlaceholderText("https://github.com/benutzer/private-repo.git oder git@github.com:benutzer/private-repo.git")
+        form.addRow("Remote-URL", self.remote_edit)
+        self.branch_combo = QComboBox(); self.branch_combo.setMinimumWidth(160)
+        form.addRow("Branch", self.branch_combo)
+        root.addLayout(form)
+        clone_row = QHBoxLayout()
+        self.clone_path = QLineEdit()
+        self.clone_path.setPlaceholderText("Zielordner für Clone (optional; sonst Name aus URL)")
+        clone_browse = QPushButton("Ziel…"); clone_browse.clicked.connect(self.choose_clone_target)
+        clone_btn = QPushButton("Private/öffentliche Repo klonen")
+        clone_btn.clicked.connect(self.clone_repo)
+        clone_row.addWidget(self.clone_path, 1); clone_row.addWidget(clone_browse); clone_row.addWidget(clone_btn)
+        root.addLayout(clone_row)
+        actions = QHBoxLayout()
+        for label, callback in [
+            ("Repo öffnen", self.load_repo), ("Status / Refresh", self.refresh),
+            ("Fetch", self.fetch), ("Pull", self.pull), ("Push", self.push),
+            ("Branch wechseln", self.switch_branch), ("Neuer Branch", self.create_branch),
+        ]:
+            b = QPushButton(label); b.clicked.connect(callback); actions.addWidget(b)
+        root.addLayout(actions)
+        commit_row = QHBoxLayout()
+        self.commit_edit = QLineEdit(); self.commit_edit.setPlaceholderText("Commit-Nachricht")
+        commit_btn = QPushButton("Änderungen committen")
+        commit_btn.clicked.connect(self.commit_changes)
+        commit_row.addWidget(self.commit_edit, 1); commit_row.addWidget(commit_btn)
+        root.addLayout(commit_row)
+        self.output = QPlainTextEdit(); self.output.setReadOnly(True); self.output.setPlaceholderText("Git-Ausgabe und Repository-Status")
+        root.addWidget(self.output, 1)
+        bottom = QHBoxLayout(); bottom.addStretch(1)
+        close_btn = QPushButton("Schließen"); close_btn.clicked.connect(self.accept); bottom.addWidget(close_btn)
+        root.addLayout(bottom)
+        # Start in the directory associated with the active document, when possible.
+        try:
+            initial = str(ide.working_directory())
+            self.repo_edit.setText(initial)
+            self.load_repo(silent=True)
+        except Exception:
+            pass
+
+    def log(self, text):
+        self.output.appendPlainText(str(text).rstrip())
+
+    def git(self, args, cwd=None, check=True):
+        env = os.environ.copy()
+        # Git Credential Manager / SSH agents can still authenticate, but Git will not
+        # hang forever waiting for a username/password in an invisible terminal.
+        env.setdefault("GIT_TERMINAL_PROMPT", "0")
+        try:
+            proc = subprocess.run(["git", *args], cwd=str(cwd or self.repo_path or Path.cwd()),
+                                  text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                  encoding="utf-8", errors="replace", env=env, timeout=180)
+        except FileNotFoundError:
+            raise RuntimeError("Git wurde nicht gefunden. Installiere Git for Windows und starte die IDE neu.")
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("Git hat nach 180 Sekunden abgebrochen.")
+        if proc.stdout.strip(): self.log(proc.stdout)
+        if check and proc.returncode:
+            hint = ""
+            low = proc.stdout.lower()
+            if "authentication failed" in low or "could not read username" in low or "permission denied (publickey)" in low:
+                hint = ("\nAuthentifizierung fehlgeschlagen. Für HTTPS Git Credential Manager verwenden/anmelden; "
+                        "für SSH einen SSH-Schlüssel beim Git-Host hinterlegen. Tokens nicht in die Remote-URL schreiben.")
+            raise RuntimeError(f"git {' '.join(args)} schlug fehl (Exit-Code {proc.returncode}).\n{proc.stdout}{hint}")
+        return proc.stdout.strip()
+
+    def choose_repo(self):
+        start = self.repo_edit.text().strip() or str(Path.home())
+        path = QFileDialog.getExistingDirectory(self, "Git-Repository auswählen", start)
+        if path:
+            self.repo_edit.setText(path); self.load_repo()
+
+    def choose_clone_target(self):
+        path = QFileDialog.getExistingDirectory(self, "Zielordner für Repository wählen", str(Path.home()))
+        if path: self.clone_path.setText(path)
+
+    def clone_repo(self):
+        url = self.remote_edit.text().strip()
+        if not url:
+            QMessageBox.warning(self, "Git", "Bitte zuerst eine HTTPS- oder SSH-Remote-URL eintragen."); return
+        target = self.clone_path.text().strip()
+        if not target:
+            name = url.rstrip("/").rsplit("/", 1)[-1].rsplit(":", 1)[-1]
+            if name.endswith(".git"): name = name[:-4]
+            target = str(Path.home() / "Documents" / name)
+        target_path = Path(target).expanduser()
+        if target_path.exists() and any(target_path.iterdir()):
+            QMessageBox.warning(self, "Git", "Der Zielordner existiert und ist nicht leer."); return
+        try:
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            self.git(["clone", "--", url, str(target_path)], cwd=target_path.parent)
+            self.repo_edit.setText(str(target_path)); self.load_repo()
+            QMessageBox.information(self, "Git", "Repository erfolgreich geklont.")
+        except Exception as e:
+            QMessageBox.critical(self, "Clone fehlgeschlagen", str(e))
+
+    def load_repo(self, silent=False):
+        path = Path(self.repo_edit.text().strip()).expanduser() if self.repo_edit.text().strip() else None
+        if path is None:
+            if not silent: QMessageBox.warning(self, "Git", "Bitte Repository-Ordner auswählen.")
+            return
+        try:
+            top = self.git(["rev-parse", "--show-toplevel"], cwd=path)
+            self.repo_path = Path(top).resolve()
+            self.repo_edit.setText(str(self.repo_path))
+            remote = self.git(["remote", "get-url", "origin"], check=False)
+            if remote and not self.remote_edit.text().strip(): self.remote_edit.setText(remote)
+            self.refresh()
+        except Exception as e:
+            self.repo_path = None
+            if not silent: QMessageBox.critical(self, "Kein Git-Repository", str(e))
+
+    def require_repo(self):
+        if not self.repo_path or not (self.repo_path / ".git").exists():
+            self.load_repo(silent=True)
+        if not self.repo_path:
+            raise RuntimeError("Bitte einen lokalen Git-Repository-Ordner auswählen und auf „Repo öffnen“ klicken.")
+
+    def run_action(self, args, success=None):
+        try:
+            self.require_repo(); self.git(args, cwd=self.repo_path)
+            if success: self.log(success)
+            self.refresh()
+        except Exception as e:
+            QMessageBox.critical(self, "Git-Fehler", str(e))
+
+    def refresh(self):
+        try:
+            self.require_repo()
+            branch = self.git(["branch", "--show-current"], cwd=self.repo_path, check=False) or "(detached HEAD)"
+            branches = self.git(["branch", "--format=%(refname:short)"], cwd=self.repo_path, check=False).splitlines()
+            self.branch_combo.clear(); self.branch_combo.addItems(branches)
+            idx = self.branch_combo.findText(branch)
+            if idx >= 0: self.branch_combo.setCurrentIndex(idx)
+            status = self.git(["status", "--short", "--branch"], cwd=self.repo_path, check=False)
+            self.log(f"\n[{self.repo_path}]\n{status or 'Arbeitsverzeichnis sauber'}")
+        except Exception as e:
+            self.log(f"Fehler: {e}")
+
+    def fetch(self): self.run_action(["fetch", "--all", "--prune"], "Fetch abgeschlossen.")
+    def pull(self): self.run_action(["pull", "--ff-only"], "Pull abgeschlossen.")
+    def push(self): self.run_action(["push"], "Push abgeschlossen.")
+
+    def switch_branch(self):
+        branch = self.branch_combo.currentText().strip()
+        if branch: self.run_action(["switch", branch], f"Branch gewechselt: {branch}")
+
+    def create_branch(self):
+        name, ok = QInputDialog.getText(self, "Neuer Branch", "Branch-Name:")
+        if ok and name.strip(): self.run_action(["switch", "-c", name.strip()], f"Branch erstellt: {name.strip()}")
+
+    def commit_changes(self):
+        message = self.commit_edit.text().strip()
+        if not message:
+            QMessageBox.warning(self, "Git", "Bitte eine Commit-Nachricht eingeben."); return
+        try:
+            self.require_repo()
+            self.git(["add", "--all"], cwd=self.repo_path)
+            self.git(["commit", "-m", message], cwd=self.repo_path)
+            self.commit_edit.clear(); self.refresh()
+        except Exception as e:
+            QMessageBox.critical(self, "Commit fehlgeschlagen", str(e))
+
+
 class BadUSBIDE(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1733,6 +1915,9 @@ class BadUSBIDE(QMainWindow):
         self.action("Plugin-Verwaltung / Marktplatz…",self.show_plugin_manager,self.extensions_menu,"Ctrl+Shift+X")
         self.action("Python-Add-on laden…",self.load_addon,self.extensions_menu)
         self.action("Add-on-Ordner öffnen",self.open_addon_folder,self.extensions_menu)
+        gitm=bar.addMenu("Git")
+        self.action("Git-Repository-Verwaltung…", self.show_git_manager, gitm, "Ctrl+Shift+G")
+        self.action("Aktuellen Ordner als Git-Repository öffnen", self.open_current_git_repo, gitm)
         tools=bar.addMenu("Werkzeuge")
         self.action("Flipper Zero verbinden…",self.connect_flipper,tools)
         self.action("Flipper-Konsole…",self.show_flipper_console,tools)
@@ -1982,6 +2167,16 @@ class BadUSBIDE(QMainWindow):
                 if i!=index:self.close_tab(i)
         elif chosen==all_:
             for i in reversed(range(self.tabs.count())): self.close_tab(i)
+    def show_git_manager(self):
+        dialog = GitManagerDialog(self)
+        dialog.exec()
+
+    def open_current_git_repo(self):
+        dialog = GitManagerDialog(self)
+        dialog.repo_edit.setText(str(self.working_directory()))
+        dialog.load_repo()
+        dialog.exec()
+
     def open_file(self):
         path,_=QFileDialog.getOpenFileName(self,"Payload öffnen",str(self.working_directory()),"BadUSB / JavaScript / Text (*.txt *.payload *.ducky *.dd *.js *.mjs);;Alle Dateien (*)")
         if not path:return
@@ -2105,9 +2300,43 @@ class BadUSBIDE(QMainWindow):
         d.mkdir(parents=True,exist_ok=True)
         return d
 
+    def marketplace_registry_file(self):
+        return self.addon_directory()/"marketplace_repositories.json"
+
+    def _save_marketplace_repository(self, name, url, path):
+        """Persist marketplace sources independently from the current dialog session."""
+        registry_file = self.marketplace_registry_file()
+        try:
+            data = json.loads(registry_file.read_text(encoding="utf-8")) if registry_file.exists() else {}
+            if not isinstance(data, dict): data = {}
+        except Exception:
+            data = {}
+        data[name] = {"url": url, "path": str(path)}
+        registry_file.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    def _discover_marketplace_repositories(self):
+        """Return every locally cloned repository and persist its Git remote for future refreshes."""
+        root = self.marketplace_directory()
+        repos = []
+        for repo in sorted(root.iterdir(), key=lambda x: x.name.lower()):
+            if not repo.is_dir() or not (repo / ".git").is_dir():
+                continue
+            remote = ""
+            try:
+                result = subprocess.run(["git", "-C", str(repo), "remote", "get-url", "origin"],
+                    capture_output=True, text=True, timeout=10, stdin=subprocess.DEVNULL, errors="replace")
+                if result.returncode == 0: remote = result.stdout.strip()
+            except Exception:
+                pass
+            if remote:
+                try: self._save_marketplace_repository(repo.name, remote, repo)
+                except Exception: pass
+            repos.append(repo)
+        return repos
+
     def _plugin_files(self):
         root=self.addon_directory()
-        return sorted((p for p in root.rglob("*.py") if not any(x.startswith(".") or x in {"__pycache__", ".git"} for x in p.relative_to(root).parts) and not p.name.startswith("_") and p.name != "setup.py"), key=lambda p:str(p).lower())
+        return sorted((p for p in root.rglob("*.py") if not any(x.startswith(".") or x in {"__pycache__", ".git", "plugin_templates", "marketplace"} for x in p.relative_to(root).parts) and not p.name.startswith("_") and p.name != "setup.py"), key=lambda p:str(p).lower())
 
     def _plugin_key(self,path):
         return str(Path(path).resolve())
@@ -2226,6 +2455,187 @@ class BadUSBIDE(QMainWindow):
         urlrow=QHBoxLayout(); url=QLineEdit(); url.setPlaceholderText("https://github.com/benutzer/plugin-repository.git"); install=QPushButton("Repository hinzufügen / aktualisieren"); urlrow.addWidget(url,1); urlrow.addWidget(install); ml.addLayout(urlrow)
         update=QPushButton("Alle Marktplatz-Repositories aktualisieren"); ml.addWidget(update)
         log=QPlainTextEdit(); log.setReadOnly(True); ml.addWidget(log,1); ml.addWidget(QLabel("Plugin-Dateien müssen register(ide) bereitstellen. Optional: ADDON_NAME und configure(ide) für Plugin-Einstellungen.")); tabs.addTab(market,"Git-Marktplatz")
+        store=QWidget(); sl=QVBoxLayout(store)
+        sl.addWidget(QLabel("Durchsuche geklonte Marketplace-Quellen. Nur Python-Dateien mit einer register(ide)-Funktion sind als IDE-Plugins geeignet."))
+        store_table=QTableWidget(0,3); store_table.setHorizontalHeaderLabels(["Plugin", "Quelle", "Letztes Update"]); store_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows); store_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers); store_table.horizontalHeader().setStretchLastSection(True); store_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection); sl.addWidget(store_table,1)
+        sr=QHBoxLayout(); refresh_store_button=QPushButton("Katalog aktualisieren"); readme_button=QPushButton("README ansehen"); install_selected_button=QPushButton("Ausgewähltes Plugin installieren"); remove_source_button=QPushButton("Marketplace-Quelle entfernen"); sr.addWidget(refresh_store_button); sr.addWidget(readme_button); sr.addWidget(install_selected_button); sr.addWidget(remove_source_button); sl.addLayout(sr); tabs.addTab(store,"Marketplace-Inhalte")
+        def ensure_builtin_plugin_template():
+            # A real, installable starter plugin is always available in the catalog,
+            # even before the user has cloned a remote marketplace repository.
+            template_root = self.addon_directory() / "plugin_templates"
+            template_root.mkdir(parents=True, exist_ok=True)
+            template_file = template_root / "plugin_template.py"
+            if not template_file.exists():
+                template_file.write_text('''"""Starter template for a BadUSB IDE add-on."""
+ADDON_NAME = "Mein Plugin (Vorlage)"
+
+
+def register(ide):
+    """Called when the plugin is activated. Add IDE actions here."""
+    from PyQt6.QtGui import QAction
+    action = QAction("Plugin-Vorlage: Hallo", ide)
+    action.triggered.connect(lambda: ide.statusBar().showMessage(
+        "Dein Plugin ist aktiv. Passe plugin_template.py an.", 5000
+    ))
+    ide.addAddonAction(action)
+
+
+def configure(ide):
+    """Optional: open a settings dialog for this plugin."""
+    from PyQt6.QtWidgets import QMessageBox
+    QMessageBox.information(ide, ADDON_NAME,
+        "Das ist eine Vorlage. Bearbeite die Datei und passe register(ide) an.")
+''', encoding="utf-8")
+            return template_file
+
+        def refresh_store(fetch_updates=True):
+            # A catalog refresh also fetches every saved repository, so newly pushed plugins appear.
+            if fetch_updates and shutil.which("git"):
+                for repo in self._discover_marketplace_repositories():
+                    try:
+                        result = run_git(["git", "-C", str(repo), "pull", "--ff-only"], timeout=180)
+                        log.appendPlainText(f"Abruf {repo.name}: {(result.stdout + ' ' + result.stderr).strip()}")
+                    except Exception as ex:
+                        log.appendPlainText(f"Abruf {repo.name} fehlgeschlagen: {ex}")
+            store_table.setRowCount(0)
+            # Catalog sources: built-in starter template plus every cloned Git repository.
+            sources = [(ensure_builtin_plugin_template().parent, "Integrierte Vorlage", False, "Integriert")]
+            for source_root in self._discover_marketplace_repositories():
+                last_update = "Unbekannt"
+                if shutil.which("git"):
+                    try:
+                        stamp = subprocess.run(
+                            ["git", "-C", str(source_root), "log", "-1", "--format=%cI"],
+                            capture_output=True, text=True, timeout=10,
+                            stdin=subprocess.DEVNULL, errors="replace"
+                        )
+                        if stamp.returncode == 0 and stamp.stdout.strip():
+                            from datetime import datetime
+                            parsed = datetime.fromisoformat(stamp.stdout.strip())
+                            last_update = parsed.astimezone().strftime("%d.%m.%Y %H:%M")
+                    except Exception:
+                        pass
+                sources.append((source_root, source_root.name, True, last_update))
+            seen = set()
+            for source_root, source_label, is_repo, last_update in sources:
+                for candidate in sorted(source_root.rglob("*.py"), key=lambda x:str(x).lower()):
+                    try:
+                        rel = candidate.relative_to(source_root)
+                        if any(part.startswith(".") or part in {"__pycache__", ".git", "venv", ".venv"} for part in rel.parts) or candidate.name.startswith("_") or candidate.name == "setup.py":
+                            continue
+                        body = candidate.read_text(encoding="utf-8", errors="replace")
+                    except Exception:
+                        continue
+                    if not re.search(r"(?m)^\s*def\s+register\s*\(\s*ide\s*\)", body):
+                        continue
+                    resolved = str(candidate.resolve())
+                    if resolved in seen:
+                        continue
+                    seen.add(resolved)
+                    name_match = re.search(r"(?m)^\s*ADDON_NAME\s*=\s*[\"']([^\"']+)", body)
+                    r = store_table.rowCount(); store_table.insertRow(r)
+                    item = QTableWidgetItem(name_match.group(1) if name_match else candidate.stem)
+                    item.setData(Qt.ItemDataRole.UserRole, str(candidate))
+                    item.setData(Qt.ItemDataRole.UserRole + 1, str(source_root))
+                    store_table.setItem(r,0,item)
+                    store_table.setItem(r,1,QTableWidgetItem(source_label))
+                    store_table.setItem(r,2,QTableWidgetItem(last_update))
+            store_table.resizeColumnsToContents()
+
+        def selected_store_source():
+            r = store_table.currentRow()
+            item = store_table.item(r, 0) if r >= 0 else None
+            return Path(item.data(Qt.ItemDataRole.UserRole)) if item and item.data(Qt.ItemDataRole.UserRole) else None
+
+        def remove_marketplace_source():
+            source = selected_store_source()
+            if source is None:
+                QMessageBox.information(dlg, "Marketplace-Quelle entfernen", "Wähle zuerst einen Eintrag aus dem Marketplace aus.")
+                return
+            source_root = source.parent
+            item = store_table.item(store_table.currentRow(), 0)
+            saved_root = Path(item.data(Qt.ItemDataRole.UserRole + 1)) if item and item.data(Qt.ItemDataRole.UserRole + 1) else source_root
+            template_root = (self.addon_directory() / "plugin_templates").resolve()
+            repo_root = saved_root.resolve()
+            if repo_root == template_root or repo_root == self.marketplace_directory().resolve():
+                QMessageBox.information(dlg, "Integrierte Vorlage", "Die integrierte Plugin-Vorlage kann nicht als Marketplace-Quelle entfernt werden.")
+                return
+            if not (repo_root / ".git").is_dir():
+                QMessageBox.information(dlg, "Keine Repository-Quelle", "Dieser Eintrag gehört zu keiner geklonten Git-Quelle.")
+                return
+            answer = QMessageBox.question(dlg, "Marketplace-Quelle entfernen?",
+                f"Das komplette lokale Repository und alle darin angebotenen Plugins aus dem Katalog entfernen?\n\n{repo_root}\n\nBereits installierte Plugin-Kopien bleiben erhalten.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            try:
+                # Only remove a repository that is a direct child of the marketplace folder.
+                marketplace_root = self.marketplace_directory().resolve()
+                if repo_root.parent != marketplace_root:
+                    raise ValueError("Das Repository liegt nicht direkt im Marketplace-Verzeichnis; aus Sicherheitsgründen wurde nichts gelöscht.")
+                shutil.rmtree(repo_root)
+                registry = self.marketplace_registry_file()
+                try:
+                    data = json.loads(registry.read_text(encoding="utf-8")) if registry.exists() else {}
+                    if isinstance(data, dict):
+                        data.pop(repo_root.name, None)
+                        registry.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+                except Exception as registry_error:
+                    log.appendPlainText("Repository entfernt, aber Registry konnte nicht aktualisiert werden: " + str(registry_error))
+                log.appendPlainText("Marketplace-Quelle entfernt: " + repo_root.name)
+                refresh_store(fetch_updates=False)
+            except Exception as exc:
+                QMessageBox.warning(dlg, "Quelle konnte nicht entfernt werden", str(exc))
+
+        def find_plugin_readme(source):
+            # Prefer a README next to the plugin; otherwise use the closest parent README.
+            for folder in (source.parent, *source.parents):
+                readme = folder / "README.md"
+                if readme.is_file():
+                    return readme
+            return None
+
+        def show_store_readme():
+            source = selected_store_source()
+            if not source:
+                QMessageBox.information(dlg, "Marketplace", "Wähle zuerst ein Plugin aus.")
+                return
+            readme = find_plugin_readme(source)
+            preview = QDialog(dlg)
+            preview.setWindowTitle("README – " + source.stem)
+            preview.resize(760, 600)
+            preview_layout = QVBoxLayout(preview)
+            from PyQt6.QtWidgets import QTextBrowser
+            browser = QTextBrowser()
+            browser.setOpenExternalLinks(True)
+            if readme:
+                try:
+                    browser.setMarkdown(readme.read_text(encoding="utf-8", errors="replace"))
+                    preview.setWindowTitle("README – " + source.stem + " (" + readme.name + ")")
+                except OSError as exc:
+                    browser.setPlainText("README konnte nicht gelesen werden:\n" + str(exc))
+            else:
+                browser.setPlainText("Für dieses Plugin wurde keine README.md gefunden.\n\nErwarteter Speicherort: neben der Plugin-Datei oder in einem übergeordneten Ordner des Repositorys.")
+            preview_layout.addWidget(browser, 1)
+            close_button = QPushButton("Schließen")
+            close_button.clicked.connect(preview.accept)
+            preview_layout.addWidget(close_button)
+            preview.exec()
+
+        def install_store_plugin():
+            source=selected_store_source()
+            if not source:
+                QMessageBox.information(dlg,"Marketplace","Wähle zuerst ein Plugin aus."); return
+            target=self.addon_directory()/source.name
+            if target.exists():
+                target=target.with_name(source.stem+"_marketplace"+source.suffix)
+            try:
+                shutil.copy2(source,target)
+                QMessageBox.information(dlg,"Plugin installiert",f"Plugin-Datei kopiert nach:\n{target}\n\nAktiviere sie im Tab 'Installierte Plugins'. Python-Plugins führen Code mit deinen Benutzerrechten aus.")
+                fill(); tabs.setCurrentWidget(page)
+            except Exception as ex:
+                QMessageBox.warning(dlg,"Installation fehlgeschlagen",str(ex))
+
         def selected():
             r=table.currentRow(); item=table.item(r,2) if r>=0 else None
             return Path(item.data(Qt.ItemDataRole.UserRole)) if item else None
@@ -2259,31 +2669,60 @@ class BadUSBIDE(QMainWindow):
             try:path.unlink(); fill()
             except Exception as ex:QMessageBox.warning(dlg,"Löschen fehlgeschlagen",str(ex))
         def git_repo(repo_path):
-            result=subprocess.run(["git","-C",str(repo_path),"pull","--ff-only"],capture_output=True,text=True,timeout=180) if (repo_path/".git").is_dir() else None
-            if result is None:return subprocess.run(["git","clone","--depth","1",url.text().strip(),str(repo_path)],capture_output=True,text=True,timeout=240)
+            result=run_git(["git","-C",str(repo_path),"pull","--ff-only"],timeout=180) if (repo_path/".git").is_dir() else None
+            if result is None:return run_git(["git","clone","--depth","1",normalize_repo_url(url.text()),str(repo_path)],timeout=240)
             return result
+        def normalize_repo_url(value):
+            # Accept a raw Git URL and common Markdown/link formats pasted from a README/chat.
+            value = (value or "").strip().strip("<>\"'")
+            m = re.search(r"\]\((https?://[^)]+|ssh://[^)]+|git@[^)]+)\)", value)
+            if m:
+                value = m.group(1)
+            elif value.startswith("[") and "](" in value:
+                value = value.split("](", 1)[1].rstrip(")")
+            value = value.strip().rstrip(".,")
+            return value
+
+        def run_git(args, timeout=240):
+            env = os.environ.copy()
+            # GUI subprocesses have no /dev/tty. Never let Git try an interactive prompt.
+            env["GIT_TERMINAL_PROMPT"] = "0"
+            env["GCM_INTERACTIVE"] = "Never"
+            env["GIT_ASKPASS"] = ""
+            env["SSH_ASKPASS"] = ""
+            return subprocess.run(args, capture_output=True, text=True, timeout=timeout, env=env,
+                                  stdin=subprocess.DEVNULL, errors="replace")
+
         def install_repo():
-            repo=url.text().strip()
-            if not (repo.startswith("https://") or repo.startswith("ssh://") or repo.startswith("git@")):
-                QMessageBox.warning(dlg,"Repository-URL","Bitte eine HTTPS- oder SSH-Git-URL eingeben."); return
+            repo=normalize_repo_url(url.text())
+            if not (repo.startswith("https://") or repo.startswith("http://") or repo.startswith("ssh://") or repo.startswith("git@")):
+                QMessageBox.warning(dlg,"Repository-URL","Bitte eine rohe Git-URL eingeben, z. B. https://github.com/OWNER/REPO.git. Markdown-Linktext wird automatisch entfernt."); return
             if not shutil.which("git"):QMessageBox.warning(dlg,"Git fehlt","Installiere Git und stelle sicher, dass git im PATH liegt."); return
             name=Path(repo.rstrip("/").removesuffix(".git")).name; name=re.sub(r"[^A-Za-z0-9_.-]","_",name) or "plugin_repo"; dest=self.marketplace_directory()/name
             try:
-                result=git_repo(dest); out=(result.stdout+"\n"+result.stderr).strip(); log.appendPlainText("Repository: "+repo+"\n"+out)
-                if result.returncode:QMessageBox.warning(dlg,"Git fehlgeschlagen",out)
-                else:QMessageBox.information(dlg,"Repository geladen","Repository wurde geladen. Prüfe seine Dateien und aktiviere vertrauenswürdige Plugins im ersten Tab.")
-                fill()
+                result=git_repo(dest) if (dest/".git").is_dir() else run_git(["git","clone","--depth","1",repo,str(dest)], timeout=240)
+                out=(result.stdout+"\n"+result.stderr).strip(); log.appendPlainText("Repository: "+repo+"\n"+out)
+                if result.returncode:
+                    hint = ""
+                    if "could not read Username" in out or "terminal prompts disabled" in out or "Authentication failed" in out or "/dev/tty" in out:
+                        hint = "\n\nGit konnte keine interaktive Anmeldung öffnen. Für private HTTPS-Repositories melde dich zuerst über Git Credential Manager an (z. B. git credential manager / Browser-Login), oder verwende eine SSH-URL mit eingerichtetem SSH-Schlüssel. Keine Tokens in die Repository-URL schreiben."
+                    QMessageBox.warning(dlg,"Git fehlgeschlagen",out+hint)
+                else:
+                    try: self._save_marketplace_repository(name, repo, dest)
+                    except Exception as registry_error: log.appendPlainText("Repository-Liste konnte nicht gespeichert werden: " + str(registry_error))
+                    QMessageBox.information(dlg,"Repository geladen","Marketplace-Quelle wurde lokal geladen und gespeichert. Öffne den Tab 'Marketplace-Inhalte', um gefundene Plugins zu durchsuchen und einzeln zu installieren.")
+                fill(); refresh_store(fetch_updates=False)
             except Exception as ex:QMessageBox.warning(dlg,"Git-Fehler",str(ex))
         def update_repos():
             if not shutil.which("git"):QMessageBox.warning(dlg,"Git fehlt","Installiere Git zuerst."); return
-            for repo in self.marketplace_directory().iterdir():
-                if repo.is_dir() and (repo/".git").is_dir():
+            for repo in self._discover_marketplace_repositories():
                     try:
-                        r=subprocess.run(["git","-C",str(repo),"pull","--ff-only"],capture_output=True,text=True,timeout=180); log.appendPlainText(repo.name+": "+r.stdout+" "+r.stderr)
+                        r=run_git(["git","-C",str(repo),"pull","--ff-only"],timeout=180); log.appendPlainText(repo.name+": "+r.stdout+" "+r.stderr)
                     except Exception as ex:log.appendPlainText(repo.name+": "+str(ex))
-            fill()
+            fill(); refresh_store(fetch_updates=False)
+        refresh_store_button.clicked.connect(lambda: refresh_store(fetch_updates=True)); readme_button.clicked.connect(show_store_readme); install_selected_button.clicked.connect(install_store_plugin); remove_source_button.clicked.connect(remove_marketplace_source); store_table.cellDoubleClicked.connect(lambda _row, _column: show_store_readme())
         buttons["Aktualisieren"].clicked.connect(fill); buttons["Aktivieren"].clicked.connect(activate); buttons["Deaktivieren"].clicked.connect(deactivate); buttons["Einstellungen…"].clicked.connect(configure); buttons["Datei löschen…"].clicked.connect(delete_plugin); install.clicked.connect(install_repo); update.clicked.connect(update_repos); table.cellDoubleClicked.connect(lambda *_:configure())
-        fill(); bb=QDialogButtonBox(QDialogButtonBox.StandardButton.Close); bb.rejected.connect(dlg.reject); root.addWidget(bb); dlg.exec()
+        fill(); refresh_store(); bb=QDialogButtonBox(QDialogButtonBox.StandardButton.Close); bb.rejected.connect(dlg.reject); root.addWidget(bb); dlg.exec()
 
     def disconnect_flipper(self):
         try:
@@ -3603,6 +4042,11 @@ def main():
     app=QApplication(sys.argv)
     app.setApplicationName("BadUSB IDE")
     win=BadUSBIDE()
+    # Make the main window visible and focused even if saved window state was minimized/off-screen.
+    win.showNormal()
     win.show()
+    win.raise_()
+    win.activateWindow()
+    QTimer.singleShot(150, lambda: (win.showNormal(), win.raise_(), win.activateWindow()))
     sys.exit(app.exec())
 if __name__=='__main__': main()
