@@ -2454,39 +2454,95 @@ class BadUSBIDE(QMainWindow):
         market=QWidget(); ml=QVBoxLayout(market); ml.addWidget(QLabel("Git-Repository als Marktplatzquelle klonen oder aktualisieren. Git muss installiert sein."))
         urlrow=QHBoxLayout(); url=QLineEdit(); url.setPlaceholderText("https://github.com/benutzer/plugin-repository.git"); install=QPushButton("Repository hinzufügen / aktualisieren"); urlrow.addWidget(url,1); urlrow.addWidget(install); ml.addLayout(urlrow)
         update=QPushButton("Alle Marktplatz-Repositories aktualisieren"); ml.addWidget(update)
-        log=QPlainTextEdit(); log.setReadOnly(True); ml.addWidget(log,1); ml.addWidget(QLabel("Plugin-Dateien müssen register(ide) bereitstellen. Optional: ADDON_NAME und configure(ide) für Plugin-Einstellungen.")); tabs.addTab(market,"Git-Marktplatz")
+        repo_table=QTableWidget(0,3); repo_table.setHorizontalHeaderLabels(["Marketplace", "Letzter Commit", "Repository-URL"]); repo_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows); repo_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers); repo_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection); repo_table.horizontalHeader().setStretchLastSection(True); ml.addWidget(repo_table,1)
+        repo_buttons=QHBoxLayout(); repo_readme_button=QPushButton("Marketplace-README ansehen"); repo_remove_button=QPushButton("Ausgewählten Marketplace entfernen"); repo_buttons.addWidget(repo_readme_button); repo_buttons.addWidget(repo_remove_button); ml.addLayout(repo_buttons)
+        log=QPlainTextEdit(); log.setReadOnly(True); log.setMaximumHeight(100); ml.addWidget(log); ml.addWidget(QLabel("Plugin-Dateien müssen register(ide) bereitstellen. Optional: ADDON_NAME, VERSION und configure(ide).")); tabs.addTab(market,"Git-Marktplatz")
         store=QWidget(); sl=QVBoxLayout(store)
         sl.addWidget(QLabel("Durchsuche geklonte Marketplace-Quellen. Nur Python-Dateien mit einer register(ide)-Funktion sind als IDE-Plugins geeignet."))
-        store_table=QTableWidget(0,3); store_table.setHorizontalHeaderLabels(["Plugin", "Quelle", "Letztes Update"]); store_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows); store_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers); store_table.horizontalHeader().setStretchLastSection(True); store_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection); sl.addWidget(store_table,1)
+        store_table=QTableWidget(0,5); store_table.setHorizontalHeaderLabels(["Name", "Typ", "Version", "Marketplace", "Letzter Commit"]); store_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows); store_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers); store_table.horizontalHeader().setStretchLastSection(True); store_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection); sl.addWidget(store_table,1)
         sr=QHBoxLayout(); refresh_store_button=QPushButton("Katalog aktualisieren"); readme_button=QPushButton("README ansehen"); install_selected_button=QPushButton("Ausgewähltes Plugin installieren"); remove_source_button=QPushButton("Marketplace-Quelle entfernen"); sr.addWidget(refresh_store_button); sr.addWidget(readme_button); sr.addWidget(install_selected_button); sr.addWidget(remove_source_button); sl.addLayout(sr); tabs.addTab(store,"Marketplace-Inhalte")
-        def ensure_builtin_plugin_template():
-            # A real, installable starter plugin is always available in the catalog,
-            # even before the user has cloned a remote marketplace repository.
-            template_root = self.addon_directory() / "plugin_templates"
-            template_root.mkdir(parents=True, exist_ok=True)
-            template_file = template_root / "plugin_template.py"
-            if not template_file.exists():
-                template_file.write_text('''"""Starter template for a BadUSB IDE add-on."""
-ADDON_NAME = "Mein Plugin (Vorlage)"
+        def repo_last_commit(repo_path):
+            if not shutil.which("git") or not (Path(repo_path) / ".git").is_dir():
+                return "Unbekannt"
+            try:
+                stamp = subprocess.run(["git", "-C", str(repo_path), "log", "-1", "--format=%cI"], capture_output=True, text=True, timeout=10, stdin=subprocess.DEVNULL, errors="replace")
+                if stamp.returncode == 0 and stamp.stdout.strip():
+                    from datetime import datetime
+                    return datetime.fromisoformat(stamp.stdout.strip()).astimezone().strftime("%d.%m.%Y %H:%M")
+            except Exception:
+                pass
+            return "Unbekannt"
 
+        def repo_readme_path(repo_path):
+            root_path = Path(repo_path)
+            for name in ("README.md", "Readme.md", "readme.md", "README.MD"):
+                candidate = root_path / name
+                if candidate.is_file(): return candidate
+            return None
 
-def register(ide):
-    """Called when the plugin is activated. Add IDE actions here."""
-    from PyQt6.QtGui import QAction
-    action = QAction("Plugin-Vorlage: Hallo", ide)
-    action.triggered.connect(lambda: ide.statusBar().showMessage(
-        "Dein Plugin ist aktiv. Passe plugin_template.py an.", 5000
-    ))
-    ide.addAddonAction(action)
+        def fill_marketplaces():
+            repo_table.setRowCount(0)
+            registry = self.marketplace_registry_file()
+            try:
+                saved = json.loads(registry.read_text(encoding="utf-8")) if registry.exists() else {}
+            except Exception:
+                saved = {}
+            for repo_path in self._discover_marketplace_repositories():
+                name = repo_path.name
+                url_value = saved.get(name, {}).get("url", "") if isinstance(saved.get(name, {}), dict) else ""
+                if not url_value and shutil.which("git"):
+                    try:
+                        url_value = subprocess.run(["git", "-C", str(repo_path), "remote", "get-url", "origin"], capture_output=True, text=True, timeout=10, stdin=subprocess.DEVNULL, errors="replace").stdout.strip()
+                    except Exception: pass
+                r = repo_table.rowCount(); repo_table.insertRow(r)
+                name_item = QTableWidgetItem(name); name_item.setData(Qt.ItemDataRole.UserRole, str(repo_path))
+                repo_table.setItem(r, 0, name_item)
+                repo_table.setItem(r, 1, QTableWidgetItem(repo_last_commit(repo_path)))
+                repo_table.setItem(r, 2, QTableWidgetItem(url_value or "Unbekannt"))
+            repo_table.resizeColumnsToContents()
 
+        def selected_marketplace_path():
+            r = repo_table.currentRow()
+            item = repo_table.item(r, 0) if r >= 0 else None
+            return Path(item.data(Qt.ItemDataRole.UserRole)) if item and item.data(Qt.ItemDataRole.UserRole) else None
 
-def configure(ide):
-    """Optional: open a settings dialog for this plugin."""
-    from PyQt6.QtWidgets import QMessageBox
-    QMessageBox.information(ide, ADDON_NAME,
-        "Das ist eine Vorlage. Bearbeite die Datei und passe register(ide) an.")
-''', encoding="utf-8")
-            return template_file
+        def show_marketplace_readme():
+            repo_path = selected_marketplace_path()
+            if not repo_path:
+                QMessageBox.information(dlg, "Marketplace-README", "Wähle zuerst einen Marketplace aus."); return
+            readme = repo_readme_path(repo_path)
+            preview = QDialog(dlg); preview.setWindowTitle("Marketplace-README – " + repo_path.name); preview.resize(760, 600)
+            layout = QVBoxLayout(preview)
+            from PyQt6.QtWidgets import QTextBrowser
+            browser = QTextBrowser(); browser.setOpenExternalLinks(True)
+            if readme:
+                browser.setMarkdown(readme.read_text(encoding="utf-8", errors="replace"))
+            else:
+                browser.setPlainText("Dieses Repository enthält keine README.md im Stammverzeichnis.")
+            layout.addWidget(browser, 1)
+            close_button = QPushButton("Schließen"); close_button.clicked.connect(preview.accept); layout.addWidget(close_button)
+            preview.exec()
+
+        def remove_selected_marketplace():
+            repo_path = selected_marketplace_path()
+            if not repo_path:
+                QMessageBox.information(dlg, "Marketplace entfernen", "Wähle zuerst einen Marketplace aus."); return
+            answer = QMessageBox.question(dlg, "Marketplace entfernen?", f"Lokale Marketplace-Quelle samt Katalogdateien löschen?\n\n{repo_path}\n\nBereits installierte Plugins bleiben erhalten.", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
+            if answer != QMessageBox.StandardButton.Yes: return
+            try:
+                if repo_path.resolve().parent != self.marketplace_directory().resolve():
+                    raise ValueError("Repository liegt nicht direkt im Marketplace-Verzeichnis.")
+                shutil.rmtree(repo_path)
+                registry = self.marketplace_registry_file()
+                try:
+                    data = json.loads(registry.read_text(encoding="utf-8")) if registry.exists() else {}
+                    if isinstance(data, dict):
+                        data.pop(repo_path.name, None); registry.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+                except Exception as exc: log.appendPlainText("Registry konnte nicht aktualisiert werden: " + str(exc))
+                log.appendPlainText("Marketplace entfernt: " + repo_path.name)
+                fill_marketplaces(); refresh_store(fetch_updates=False)
+            except Exception as exc:
+                QMessageBox.warning(dlg, "Entfernen fehlgeschlagen", str(exc))
 
         def refresh_store(fetch_updates=True):
             # A catalog refresh also fetches every saved repository, so newly pushed plugins appear.
@@ -2498,24 +2554,10 @@ def configure(ide):
                     except Exception as ex:
                         log.appendPlainText(f"Abruf {repo.name} fehlgeschlagen: {ex}")
             store_table.setRowCount(0)
-            # Catalog sources: built-in starter template plus every cloned Git repository.
-            sources = [(ensure_builtin_plugin_template().parent, "Integrierte Vorlage", False, "Integriert")]
+            # Only list explicitly added/cloned marketplace repositories; no built-in template.
+            sources = []
             for source_root in self._discover_marketplace_repositories():
-                last_update = "Unbekannt"
-                if shutil.which("git"):
-                    try:
-                        stamp = subprocess.run(
-                            ["git", "-C", str(source_root), "log", "-1", "--format=%cI"],
-                            capture_output=True, text=True, timeout=10,
-                            stdin=subprocess.DEVNULL, errors="replace"
-                        )
-                        if stamp.returncode == 0 and stamp.stdout.strip():
-                            from datetime import datetime
-                            parsed = datetime.fromisoformat(stamp.stdout.strip())
-                            last_update = parsed.astimezone().strftime("%d.%m.%Y %H:%M")
-                    except Exception:
-                        pass
-                sources.append((source_root, source_root.name, True, last_update))
+                sources.append((source_root, source_root.name, True, repo_last_commit(source_root)))
             seen = set()
             for source_root, source_label, is_repo, last_update in sources:
                 for candidate in sorted(source_root.rglob("*.py"), key=lambda x:str(x).lower()):
@@ -2533,13 +2575,18 @@ def configure(ide):
                         continue
                     seen.add(resolved)
                     name_match = re.search(r"(?m)^\s*ADDON_NAME\s*=\s*[\"']([^\"']+)", body)
+                    version_match = re.search(r"(?m)^\s*(?:VERSION|__version__)\s*=\s*[\"']([^\"']+)", body)
+                    is_template = (not is_repo) or any(part.lower() in {"template", "templates", "vorlage", "vorlagen"} for part in rel.parts) or "template" in candidate.stem.lower() or "vorlage" in candidate.stem.lower()
+                    plugin_type = "Vorlage" if is_template else "Plugin"
                     r = store_table.rowCount(); store_table.insertRow(r)
                     item = QTableWidgetItem(name_match.group(1) if name_match else candidate.stem)
                     item.setData(Qt.ItemDataRole.UserRole, str(candidate))
                     item.setData(Qt.ItemDataRole.UserRole + 1, str(source_root))
                     store_table.setItem(r,0,item)
-                    store_table.setItem(r,1,QTableWidgetItem(source_label))
-                    store_table.setItem(r,2,QTableWidgetItem(last_update))
+                    store_table.setItem(r,1,QTableWidgetItem(plugin_type))
+                    store_table.setItem(r,2,QTableWidgetItem(version_match.group(1) if version_match else "Nicht angegeben"))
+                    store_table.setItem(r,3,QTableWidgetItem(source_label))
+                    store_table.setItem(r,4,QTableWidgetItem(last_update))
             store_table.resizeColumnsToContents()
 
         def selected_store_source():
@@ -2555,10 +2602,9 @@ def configure(ide):
             source_root = source.parent
             item = store_table.item(store_table.currentRow(), 0)
             saved_root = Path(item.data(Qt.ItemDataRole.UserRole + 1)) if item and item.data(Qt.ItemDataRole.UserRole + 1) else source_root
-            template_root = (self.addon_directory() / "plugin_templates").resolve()
             repo_root = saved_root.resolve()
-            if repo_root == template_root or repo_root == self.marketplace_directory().resolve():
-                QMessageBox.information(dlg, "Integrierte Vorlage", "Die integrierte Plugin-Vorlage kann nicht als Marketplace-Quelle entfernt werden.")
+            if repo_root == self.marketplace_directory().resolve():
+                QMessageBox.information(dlg, "Ungültige Quelle", "Bitte wähle ein konkretes Marketplace-Repository aus.")
                 return
             if not (repo_root / ".git").is_dir():
                 QMessageBox.information(dlg, "Keine Repository-Quelle", "Dieser Eintrag gehört zu keiner geklonten Git-Quelle.")
@@ -2721,8 +2767,9 @@ def configure(ide):
                     except Exception as ex:log.appendPlainText(repo.name+": "+str(ex))
             fill(); refresh_store(fetch_updates=False)
         refresh_store_button.clicked.connect(lambda: refresh_store(fetch_updates=True)); readme_button.clicked.connect(show_store_readme); install_selected_button.clicked.connect(install_store_plugin); remove_source_button.clicked.connect(remove_marketplace_source); store_table.cellDoubleClicked.connect(lambda _row, _column: show_store_readme())
+        repo_readme_button.clicked.connect(show_marketplace_readme); repo_remove_button.clicked.connect(remove_selected_marketplace); repo_table.cellDoubleClicked.connect(lambda _row, _column: show_marketplace_readme())
         buttons["Aktualisieren"].clicked.connect(fill); buttons["Aktivieren"].clicked.connect(activate); buttons["Deaktivieren"].clicked.connect(deactivate); buttons["Einstellungen…"].clicked.connect(configure); buttons["Datei löschen…"].clicked.connect(delete_plugin); install.clicked.connect(install_repo); update.clicked.connect(update_repos); table.cellDoubleClicked.connect(lambda *_:configure())
-        fill(); refresh_store(); bb=QDialogButtonBox(QDialogButtonBox.StandardButton.Close); bb.rejected.connect(dlg.reject); root.addWidget(bb); dlg.exec()
+        fill(); fill_marketplaces(); refresh_store(); bb=QDialogButtonBox(QDialogButtonBox.StandardButton.Close); bb.rejected.connect(dlg.reject); root.addWidget(bb); dlg.exec()
 
     def disconnect_flipper(self):
         try:
