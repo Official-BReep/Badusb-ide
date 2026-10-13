@@ -37,6 +37,8 @@ from PyQt6.QtGui import (
     QFont,
     QKeySequence,
     QPainter,
+    QIcon,
+    QPixmap,
     QSyntaxHighlighter,
     QTextCharFormat,
     QTextCursor,
@@ -64,6 +66,7 @@ from PyQt6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
     QSpinBox,
     QSplitter,
@@ -2458,20 +2461,15 @@ class BadUSBIDE(QMainWindow):
         update=QPushButton("Alle Marktplatz-Repositories aktualisieren"); ml.addWidget(update)
         repo_search=QLineEdit(); repo_search.setPlaceholderText("Lokal suchen: Marketplace-Name oder Repository-URL …"); ml.addWidget(repo_search)
         repo_table=QTableWidget(0,3); repo_table.setHorizontalHeaderLabels(["Marketplace", "Letzter Commit", "Repository-URL"]); repo_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows); repo_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers); repo_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection); repo_table.horizontalHeader().setStretchLastSection(True); ml.addWidget(repo_table,1)
-        remote_repo_toggle=QPushButton("＋ Remote-GitHub-Suche anzeigen")
-        remote_repo_toggle.setCheckable(True)
+        remote_repo_toggle=QPushButton("🔎 Remote-GitHub-Suche öffnen …")
+        remote_repo_toggle.setToolTip("Öffnet die GitHub-Suche in einem separaten Fenster, damit dieser Tab übersichtlich bleibt.")
         ml.addWidget(remote_repo_toggle)
-        remote_repo_panel=QWidget(); remote_repo_layout=QVBoxLayout(remote_repo_panel); remote_repo_layout.setContentsMargins(0,0,0,0)
-        remote_repo_row=QHBoxLayout(); remote_repo_search=QLineEdit(); remote_repo_search.setPlaceholderText("Remote auf GitHub suchen (z. B. Flipper Zero BadUSB)"); remote_repo_button=QPushButton("Remote suchen"); remote_repo_row.addWidget(remote_repo_search,1); remote_repo_row.addWidget(remote_repo_button); remote_repo_layout.addLayout(remote_repo_row)
-        remote_repo_table=QTableWidget(0,3); remote_repo_table.setHorizontalHeaderLabels(["GitHub-Repository", "Beschreibung", "URL"]); remote_repo_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows); remote_repo_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers); remote_repo_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection); remote_repo_table.horizontalHeader().setStretchLastSection(True); remote_repo_table.setMaximumHeight(150); remote_repo_layout.addWidget(remote_repo_table)
-        remote_add_button=QPushButton("Ausgewähltes Remote-Repository als Marketplace hinzufügen"); remote_repo_layout.addWidget(remote_add_button)
-        remote_repo_panel.setVisible(False); ml.addWidget(remote_repo_panel)
         repo_buttons=QHBoxLayout(); repo_readme_button=QPushButton("Marketplace-README ansehen"); repo_remove_button=QPushButton("Ausgewählten Marketplace entfernen"); repo_buttons.addWidget(repo_readme_button); repo_buttons.addWidget(repo_remove_button); ml.addLayout(repo_buttons)
         log=QPlainTextEdit(); log.setReadOnly(True); log.setMaximumHeight(100); ml.addWidget(log); ml.addWidget(QLabel("Plugin-Dateien müssen register(ide) bereitstellen. Optional: ADDON_NAME, VERSION und configure(ide).")); tabs.addTab(market,"Git-Marktplatz")
         store=QWidget(); sl=QVBoxLayout(store)
         sl.addWidget(QLabel("Durchsuche die lokal geladenen Marketplace-Inhalte. Neue GitHub-Repositorys findest du im Tab ‚Git-Marktplatz‘ über die einklappbare Remote-Suche."))
         store_search=QLineEdit(); store_search.setPlaceholderText("Lokal suchen: Plugin-Name, Typ, Version oder Marketplace …"); sl.addWidget(store_search)
-        store_table=QTableWidget(0,5); store_table.setHorizontalHeaderLabels(["Name", "Typ", "Version", "Marketplace", "Letzter Commit"]); store_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows); store_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers); store_table.horizontalHeader().setStretchLastSection(True); store_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection); sl.addWidget(store_table,1)
+        store_table=QTableWidget(0,6); store_table.setHorizontalHeaderLabels(["Name", "Typ", "Version", "Beschreibung", "Marketplace", "Letzter Commit"]); store_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows); store_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers); store_table.horizontalHeader().setStretchLastSection(True); store_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection); sl.addWidget(store_table,1)
         sr=QHBoxLayout(); refresh_store_button=QPushButton("Katalog aktualisieren"); readme_button=QPushButton("README ansehen"); install_selected_button=QPushButton("Ausgewähltes Plugin installieren"); remove_source_button=QPushButton("Marketplace-Quelle entfernen"); sr.addWidget(refresh_store_button); sr.addWidget(readme_button); sr.addWidget(install_selected_button); sr.addWidget(remove_source_button); sl.addLayout(sr); tabs.addTab(store,"Marketplace-Inhalte")
         def apply_table_filter(table_widget, query, columns=None):
             needle = (query or "").strip().casefold()
@@ -2599,6 +2597,131 @@ class BadUSBIDE(QMainWindow):
             except Exception as exc:
                 QMessageBox.warning(dlg, "Entfernen fehlgeschlagen", str(exc))
 
+        def detect_python_plugin_metadata(candidate, source_root, body):
+            """Extract plugin name and description from Python declarations and docstrings."""
+            import ast
+            name = None
+            description = None
+            name_keys = {"ADDON_NAME", "PLUGIN_NAME", "NAME"}
+            description_keys = {"ADDON_DESCRIPTION", "PLUGIN_DESCRIPTION", "DESCRIPTION", "ADDON_DESC", "PLUGIN_DESC"}
+            try:
+                tree = ast.parse(body, filename=str(candidate))
+                for node in tree.body:
+                    targets = []
+                    value_node = None
+                    if isinstance(node, ast.Assign):
+                        targets = node.targets
+                        value_node = node.value
+                    elif isinstance(node, ast.AnnAssign):
+                        targets = [node.target]
+                        value_node = node.value
+                    if value_node is None:
+                        continue
+                    names = {target.id for target in targets if isinstance(target, ast.Name)}
+                    if names & name_keys and name is None:
+                        try:
+                            value = ast.literal_eval(value_node)
+                            if isinstance(value, str) and value.strip(): name = value.strip()
+                        except Exception: pass
+                    if names & description_keys and description is None:
+                        try:
+                            value = ast.literal_eval(value_node)
+                            if isinstance(value, str) and value.strip(): description = " ".join(value.strip().split())
+                        except Exception: pass
+                if description is None:
+                    doc = ast.get_docstring(tree)
+                    if doc:
+                        description = " ".join(doc.strip().split())
+            except Exception:
+                pass
+            # Also support common assignments that AST cannot statically evaluate.
+            if name is None:
+                match = re.search(r"(?m)^\s*(?:ADDON_NAME|PLUGIN_NAME|NAME)\s*(?::[^=\n]+)?=\s*[\"']([^\"']+)", body)
+                if match: name = match.group(1).strip()
+            if description is None:
+                match = re.search(r"(?m)^\s*(?:ADDON_DESCRIPTION|PLUGIN_DESCRIPTION|DESCRIPTION|ADDON_DESC|PLUGIN_DESC)\s*(?::[^=\n]+)?=\s*[\"']([^\"']+)", body)
+                if match: description = " ".join(match.group(1).strip().split())
+            # Metadata files can supplement missing Python declarations.
+            for root_path in (candidate.parent, source_root):
+                for filename in ("plugin.json", "manifest.json", "metadata.json"):
+                    try:
+                        metadata = json.loads((root_path / filename).read_text(encoding="utf-8"))
+                        if isinstance(metadata, dict):
+                            if name is None:
+                                val = metadata.get("name") or metadata.get("ADDON_NAME") or metadata.get("plugin_name")
+                                if isinstance(val, str) and val.strip(): name = val.strip()
+                            if description is None:
+                                val = metadata.get("description") or metadata.get("ADDON_DESCRIPTION") or metadata.get("plugin_description")
+                                if isinstance(val, str) and val.strip(): description = " ".join(str(val).strip().split())
+                    except Exception: pass
+                if name and description: break
+            return name, description
+
+        def detect_plugin_version(candidate, source_root, body):
+            """Read a plugin version from Python constants or common package metadata."""
+            import ast
+            # Python constants: VERSION = "1.2", __version__, or annotated assignments.
+            try:
+                tree = ast.parse(body, filename=str(candidate))
+                for node in tree.body:
+                    targets = []
+                    value_node = None
+                    if isinstance(node, ast.Assign):
+                        targets = node.targets
+                        value_node = node.value
+                    elif isinstance(node, ast.AnnAssign):
+                        targets = [node.target]
+                        value_node = node.value
+                    if value_node is None:
+                        continue
+                    if any(isinstance(target, ast.Name) and target.id in {"VERSION", "__version__", "PLUGIN_VERSION", "ADDON_VERSION"} for target in targets):
+                        try:
+                            value = ast.literal_eval(value_node)
+                            if isinstance(value, (str, int, float)) and str(value).strip():
+                                return str(value).strip()
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            # Flexible source fallback (also handles type annotations and spacing).
+            match = re.search(r"(?m)^\s*(?:VERSION|__version__|PLUGIN_VERSION|ADDON_VERSION)\s*(?::[^=\n]+)?=\s*[\"\']([^\"\']+)[\"\']", body)
+            if match:
+                return match.group(1).strip()
+
+            # Metadata files commonly used by plugins and Python projects.
+            roots = []
+            for root_path in (candidate.parent, source_root):
+                if root_path not in roots:
+                    roots.append(root_path)
+            for root_path in roots:
+                for filename in ("VERSION", "version.txt", "VERSION.txt"):
+                    version_file = root_path / filename
+                    try:
+                        value = version_file.read_text(encoding="utf-8", errors="replace").strip()
+                        if value and len(value.splitlines()) == 1:
+                            return value
+                    except Exception:
+                        pass
+                for filename in ("plugin.json", "manifest.json", "metadata.json"):
+                    try:
+                        metadata = json.loads((root_path / filename).read_text(encoding="utf-8"))
+                        if isinstance(metadata, dict):
+                            value = metadata.get("version") or metadata.get("VERSION") or metadata.get("__version__") or metadata.get("PLUGIN_VERSION") or metadata.get("ADDON_VERSION")
+                            if value is not None and str(value).strip():
+                                return str(value).strip()
+                    except Exception:
+                        pass
+                try:
+                    pyproject = (root_path / "pyproject.toml").read_text(encoding="utf-8", errors="replace")
+                    section = re.search(r"(?ms)^\[project\]\s*(.*?)(?=^\[|\Z)", pyproject)
+                    if section:
+                        match = re.search(r"(?m)^\s*version\s*=\s*[\"\']([^\"\']+)[\"\']", section.group(1))
+                        if match:
+                            return match.group(1).strip()
+                except Exception:
+                    pass
+            return None
+
         def refresh_store(fetch_updates=True):
             # A catalog refresh also fetches every saved repository, so newly pushed plugins appear.
             if fetch_updates and shutil.which("git"):
@@ -2629,19 +2752,22 @@ class BadUSBIDE(QMainWindow):
                     if resolved in seen:
                         continue
                     seen.add(resolved)
-                    name_match = re.search(r"(?m)^\s*ADDON_NAME\s*=\s*[\"']([^\"']+)", body)
-                    version_match = re.search(r"(?m)^\s*(?:VERSION|__version__)\s*=\s*[\"']([^\"']+)", body)
+                    plugin_name, plugin_description = detect_python_plugin_metadata(candidate, source_root, body)
+                    plugin_version = detect_plugin_version(candidate, source_root, body)
                     is_template = (not is_repo) or any(part.lower() in {"template", "templates", "vorlage", "vorlagen"} for part in rel.parts) or "template" in candidate.stem.lower() or "vorlage" in candidate.stem.lower()
                     plugin_type = "Vorlage" if is_template else "Plugin"
                     r = store_table.rowCount(); store_table.insertRow(r)
-                    item = QTableWidgetItem(name_match.group(1) if name_match else candidate.stem)
+                    item = QTableWidgetItem(plugin_name or candidate.stem)
                     item.setData(Qt.ItemDataRole.UserRole, str(candidate))
                     item.setData(Qt.ItemDataRole.UserRole + 1, str(source_root))
                     store_table.setItem(r,0,item)
                     store_table.setItem(r,1,QTableWidgetItem(plugin_type))
-                    store_table.setItem(r,2,QTableWidgetItem(version_match.group(1) if version_match else "Nicht angegeben"))
-                    store_table.setItem(r,3,QTableWidgetItem(source_label))
-                    store_table.setItem(r,4,QTableWidgetItem(last_update))
+                    store_table.setItem(r,2,QTableWidgetItem(plugin_version if plugin_version else "Nicht angegeben"))
+                    description_item = QTableWidgetItem(plugin_description or "Keine Beschreibung angegeben")
+                    description_item.setToolTip(plugin_description or "Keine Beschreibung angegeben")
+                    store_table.setItem(r,3,description_item)
+                    store_table.setItem(r,4,QTableWidgetItem(source_label))
+                    store_table.setItem(r,5,QTableWidgetItem(last_update))
             store_table.resizeColumnsToContents()
 
         def selected_store_source():
@@ -2827,12 +2953,40 @@ class BadUSBIDE(QMainWindow):
         repo_search.textChanged.connect(lambda value: apply_table_filter(repo_table, value))
         store_search.textChanged.connect(lambda value: apply_table_filter(store_table, value))
         installed_search.textChanged.connect(lambda value: apply_table_filter(table, value))
-        remote_repo_button.clicked.connect(lambda: search_github_repositories(remote_repo_search.text(), remote_repo_table))
-        def toggle_remote_repo_search(expanded):
-            remote_repo_panel.setVisible(expanded)
-            remote_repo_toggle.setText("− Remote-GitHub-Suche ausblenden" if expanded else "＋ Remote-GitHub-Suche anzeigen")
-        remote_repo_toggle.toggled.connect(toggle_remote_repo_search)
-        remote_add_button.clicked.connect(lambda: add_remote_repository(remote_repo_table))
+        def open_remote_repo_search():
+            search_dlg = QDialog(dlg)
+            search_dlg.setWindowTitle("Remote-GitHub-Suche")
+            search_dlg.resize(850, 480)
+            search_dlg.setMinimumSize(620, 360)
+            search_layout = QVBoxLayout(search_dlg)
+            search_layout.addWidget(QLabel("Suche öffentlich verfügbare GitHub-Repositorys. Wähle ein Ergebnis aus, um es als Marketplace hinzuzufügen."))
+            search_row = QHBoxLayout()
+            remote_repo_search = QLineEdit()
+            remote_repo_search.setPlaceholderText("Suchbegriff (z. B. Flipper Zero BadUSB)")
+            remote_repo_button = QPushButton("Suchen")
+            search_row.addWidget(remote_repo_search, 1)
+            search_row.addWidget(remote_repo_button)
+            search_layout.addLayout(search_row)
+            remote_repo_table = QTableWidget(0, 3)
+            remote_repo_table.setHorizontalHeaderLabels(["GitHub-Repository", "Beschreibung", "URL"])
+            remote_repo_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+            remote_repo_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+            remote_repo_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+            remote_repo_table.horizontalHeader().setStretchLastSection(True)
+            search_layout.addWidget(remote_repo_table, 1)
+            action_row = QHBoxLayout()
+            remote_add_button = QPushButton("Ausgewähltes Repository als Marketplace hinzufügen")
+            close_button = QPushButton("Schließen")
+            action_row.addWidget(remote_add_button)
+            action_row.addStretch(1)
+            action_row.addWidget(close_button)
+            search_layout.addLayout(action_row)
+            remote_repo_button.clicked.connect(lambda: search_github_repositories(remote_repo_search.text(), remote_repo_table))
+            remote_repo_search.returnPressed.connect(remote_repo_button.click)
+            remote_add_button.clicked.connect(lambda: add_remote_repository(remote_repo_table))
+            close_button.clicked.connect(search_dlg.accept)
+            search_dlg.exec()
+        remote_repo_toggle.clicked.connect(open_remote_repo_search)
         fill(); fill_marketplaces(); refresh_store(); bb=QDialogButtonBox(QDialogButtonBox.StandardButton.Close); bb.rejected.connect(dlg.reject); root.addWidget(bb); dlg.exec()
 
     def disconnect_flipper(self):
@@ -4149,15 +4303,119 @@ class BadUSBIDE(QMainWindow):
             pass
         event.accept()
 
+class StartupSplash(QWidget):
+    """Compact startup screen shown while the IDE initializes."""
+    def __init__(self, icon_path: Path):
+        super().__init__(None, Qt.WindowType.SplashScreen | Qt.WindowType.FramelessWindowHint)
+        self.setWindowTitle("BadUSB IDE – Start")
+        self.setFixedSize(460, 300)
+        self.setStyleSheet("""
+            QWidget { background: #171a21; color: #eef2f8; font-family: Segoe UI, sans-serif; }
+            QLabel#appTitle { font-size: 22px; font-weight: 700; }
+            QLabel#subtitle { color: #aab4c4; font-size: 11px; }
+            QLabel#status { color: #d9e2f0; font-size: 12px; }
+            QProgressBar { border: 1px solid #3c4657; border-radius: 5px; background: #242a35; height: 12px; text-align: center; }
+            QProgressBar::chunk { border-radius: 4px; background: #4f8cff; }
+        """)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(28, 22, 28, 22)
+        layout.setSpacing(10)
+        logo = QLabel()
+        logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        pixmap = QPixmap(str(icon_path)) if icon_path.exists() else QPixmap()
+        if not pixmap.isNull():
+            logo.setPixmap(pixmap.scaled(88, 88, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+        else:
+            logo.setText("⚡")
+            logo.setStyleSheet("font-size: 58px;")
+        layout.addWidget(logo, 1)
+        title = QLabel("BadUSB IDE")
+        title.setObjectName("appTitle")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(title)
+        subtitle = QLabel("Flipper Zero Payload Editor")
+        subtitle.setObjectName("subtitle")
+        subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(subtitle)
+        layout.addSpacing(8)
+        self.status_label = QLabel("Starte Anwendung …")
+        self.status_label.setObjectName("status")
+        layout.addWidget(self.status_label)
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.progress.setTextVisible(False)
+        layout.addWidget(self.progress)
+        self.setWindowIcon(QIcon(str(icon_path)))
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self._center()
+
+    def _center(self):
+        screen = QApplication.primaryScreen()
+        if screen:
+            geo = screen.availableGeometry()
+            self.move(geo.center().x() - self.width() // 2, geo.center().y() - self.height() // 2)
+
+    def update_progress(self, value: int, message: str):
+        self.progress.setValue(value)
+        self.status_label.setText(message)
+        QApplication.processEvents()
+
+
 def main():
-    app=QApplication(sys.argv)
+    # Windows taskbar groups windows by AppUserModelID. Set it BEFORE creating
+    # QApplication; otherwise Windows may keep showing the generic Python icon.
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "BadUSBIDE.FlipperPayloadEditor"
+            )
+        except Exception:
+            pass
+
+    app = QApplication(sys.argv)
     app.setApplicationName("BadUSB IDE")
-    win=BadUSBIDE()
-    # Make the main window visible and focused even if saved window state was minimized/off-screen.
-    win.showNormal()
-    win.show()
-    win.raise_()
-    win.activateWindow()
-    QTimer.singleShot(150, lambda: (win.showNormal(), win.raise_(), win.activateWindow()))
-    sys.exit(app.exec())
+    icon_path = Path(__file__).resolve().parent / "coding_icon_146067.ico"
+    app_icon = QIcon(str(icon_path)) if icon_path.exists() else QIcon()
+    if not app_icon.isNull():
+        app.setWindowIcon(app_icon)
+        # Set the default icon before any top-level windows are created.
+        QApplication.setWindowIcon(app_icon)
+
+    splash = StartupSplash(icon_path)
+    splash.show()
+    QApplication.processEvents()
+    startup_steps = [
+        (8, "Initialisiere Anwendung …"),
+        (18, "Lade Einstellungen …"),
+        (30, "Prüfe Editor-Konfiguration …"),
+        (42, "Bereite Plugin-Verwaltung vor …"),
+        (54, "Initialisiere Marketplace …"),
+        (66, "Erstelle Hauptfenster …"),
+    ]
+    for value, message in startup_steps:
+        splash.update_progress(value, message)
+        time.sleep(0.12)
+
+    try:
+        win = BadUSBIDE()
+        if not app_icon.isNull():
+            win.setWindowIcon(app_icon)
+        splash.update_progress(88, "Stelle Oberfläche fertig …")
+        time.sleep(0.12)
+        # Show the main window normally even if the saved geometry was minimized/off-screen.
+        win.showNormal()
+        win.show()
+        win.raise_()
+        win.activateWindow()
+        splash.update_progress(100, "Fertig – öffne BadUSB IDE …")
+        time.sleep(0.18)
+        splash.close()
+        QTimer.singleShot(150, lambda: (win.showNormal(), win.raise_(), win.activateWindow()))
+        sys.exit(app.exec())
+    except Exception:
+        splash.close()
+        raise
+
 if __name__=='__main__': main()
