@@ -6,6 +6,8 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shutil
+import subprocess
 import asyncio
 import re
 import sys
@@ -55,6 +57,8 @@ from PyQt6.QtWidgets import (
     QInputDialog,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMenu,
     QMessageBox,
@@ -666,6 +670,8 @@ class BadUSBIDE(QMainWindow):
         self.docs={}
         self.addon_actions=[]
         self.addon_modules=[]
+        self.addon_records={}
+        self.addon_docks=[]
         self.serial_conn=None
         self.serial_port=None
         self.serial_lock=threading.RLock()
@@ -676,10 +682,37 @@ class BadUSBIDE(QMainWindow):
         self.new_tab()
         self.apply_preferences()
         self.update_working_directory()
+        self._load_enabled_addons()
+        # Restore the final layout only after every built-in and enabled plugin
+        # dock has been created; otherwise Qt cannot restore plugin panel positions.
+        self._restore_window_layout()
         self.statusBar().showMessage("Bereit · PyQt6")
     def read_settings(self):
         try: return json.loads(self.settings_path.read_text(encoding='utf-8'))
         except Exception: return {}
+    def _restore_window_layout(self):
+        """Restore saved geometry and dock layout after all docks exist."""
+        if not self.settings.get('remember_window_size', True):
+            return
+        size = self.settings.get('window_size')
+        if isinstance(size, list) and len(size) == 2:
+            try:
+                self.resize(max(800, int(size[0])), max(600, int(size[1])))
+            except (TypeError, ValueError):
+                pass
+        saved_geometry = self.settings.get('window_geometry')
+        if saved_geometry:
+            try:
+                self.restoreGeometry(bytes.fromhex(saved_geometry))
+            except (ValueError, TypeError):
+                pass
+        saved_dock_state = self.settings.get('dock_state')
+        if saved_dock_state:
+            try:
+                self.restoreState(bytes.fromhex(saved_dock_state), 1)
+            except (ValueError, TypeError):
+                pass
+
     def save_settings(self):
         try:
             self.settings['theme'] = self.theme_name
@@ -698,7 +731,8 @@ class BadUSBIDE(QMainWindow):
                 self.settings['output_height'] = self.output.maximumHeight()
             if self.settings.get('remember_window_size', True):
                 self.settings['window_size'] = [self.width(), self.height()]
-                self.settings['dock_state'] = bytes(self.saveState()).hex()
+                self.settings['window_geometry'] = bytes(self.saveGeometry()).hex()
+                self.settings['dock_state'] = bytes(self.saveState(1)).hex()
             self.settings_path.write_text(json.dumps(self.settings, indent=2), encoding='utf-8')
         except OSError:
             pass
@@ -877,15 +911,6 @@ class BadUSBIDE(QMainWindow):
         self.working_dir_label = QLabel()
         self.statusBar().addPermanentWidget(self.working_dir_label, 1)
         self._build_local_file_explorer()
-        saved_dock_state = self.settings.get('dock_state')
-        if saved_dock_state:
-            try: self.restoreState(bytes.fromhex(saved_dock_state))
-            except (ValueError, TypeError): pass
-        if self.settings.get('remember_window_size', True):
-            size = self.settings.get('window_size')
-            if isinstance(size, list) and len(size) == 2:
-                try: self.resize(max(800, int(size[0])), max(600, int(size[1])))
-                except (TypeError, ValueError): pass
     def _build_local_file_explorer(self):
         """A local filesystem browser listing folders and files side by side."""
         self.file_explorer_dock = QDockWidget("Dateiexplorer", self)
@@ -1700,11 +1725,12 @@ class BadUSBIDE(QMainWindow):
         edit=bar.addMenu("Bearbeiten"); self.action("Rückgängig",lambda:self.editor_action('undo'),edit,"Ctrl+Z"); self.action("Wiederholen",lambda:self.editor_action('redo'),edit,"Ctrl+Y"); edit.addSeparator(); self.action("Suchen…",self.find_text,edit,"Ctrl+F"); self.action("Zeile duplizieren",self.duplicate_line,edit,"Ctrl+D"); self.action("Kommentar umschalten",self.toggle_comment,edit,"Ctrl+/")
         payload=bar.addMenu("Payload")
         self.action("Payload prüfen",self.check_payload,payload,"F7")
-        self.action("Vorschau",self.preview,payload,"Ctrl+Shift+P")
+        self.action("Vorschau",self.preview,payload,"Ctrl+Alt+P")
         self.action("Alle kopieren",self.copy_all,payload,"Ctrl+Shift+C")
         examples=payload.addMenu("Beispiele laden")
         for name in EXAMPLES: self.action(name,lambda checked=False,n=name:self.load_example(n),examples)
         self.extensions_menu=bar.addMenu("Erweiterungen")
+        self.action("Plugin-Verwaltung / Marktplatz…",self.show_plugin_manager,self.extensions_menu,"Ctrl+Shift+X")
         self.action("Python-Add-on laden…",self.load_addon,self.extensions_menu)
         self.action("Add-on-Ordner öffnen",self.open_addon_folder,self.extensions_menu)
         tools=bar.addMenu("Werkzeuge")
@@ -1731,6 +1757,90 @@ class BadUSBIDE(QMainWindow):
         helpm=bar.addMenu("Hilfe")
         self.action("Befehlsreferenz",self.show_js_sandbox,helpm)
         self.action("Über",self.about,helpm)
+        self.action("Befehlspalette öffnen…", self.show_command_palette, bar, "Ctrl+Shift+P")
+    def _collect_command_actions(self):
+        """Collect executable menu actions for a VS-Code-style command palette."""
+        commands = []
+        def walk(menu, prefix=""):
+            for act in menu.actions():
+                sub = act.menu()
+                if sub:
+                    walk(sub, f"{prefix}{act.text().replace('&', '')} › ")
+                elif act.isEnabled() and act.text().strip():
+                    label = act.text().replace("&", "").replace("…", "...").strip()
+                    if label and label != "Befehlspalette öffnen...":
+                        commands.append((f"{prefix}{label}", act))
+        for menu in self.menuBar().findChildren(QMenu):
+            # Only process top-level menus; recursive traversal handles children.
+            if menu.parent() is self.menuBar():
+                walk(menu)
+        # Also add common editor commands not represented by menu actions yet.
+        extra = [
+            ("Editor: Neue Datei", self.new_tab),
+            ("Editor: Aktuelle Datei speichern", self.save_file),
+            ("Editor: Suchen", self.find_text),
+            ("Editor: Zeile duplizieren", self.duplicate_line),
+            ("Editor: Kommentar umschalten", self.toggle_comment),
+            ("Payload: Prüfen", self.check_payload),
+            ("Payload: Vorschau anzeigen", self.preview),
+            ("JavaScript: Formatieren", self.format_javascript),
+            ("Ansicht: Befehle ein-/ausblenden", lambda: self.palette_dock.setVisible(not self.palette_dock.isVisible())),
+            ("Ansicht: Ollama ein-/ausblenden", lambda: self.ollama_dock.setVisible(not self.ollama_dock.isVisible())),
+            ("Ansicht: Output ein-/ausblenden", lambda: self.output_dock.setVisible(not self.output_dock.isVisible())),
+            ("Ansicht: PC-Dateiexplorer ein-/ausblenden", lambda: self.file_explorer_dock.setVisible(not self.file_explorer_dock.isVisible())),
+            ("Ansicht: Flipper-Dateiexplorer ein-/ausblenden", lambda: self.flipper_file_explorer_dock.setVisible(not self.flipper_file_explorer_dock.isVisible())),
+            ("Ansicht: Fensteranordnung zurücksetzen", self.reset_dock_layout),
+            ("Einstellungen öffnen", self.show_settings),
+        ]
+        known = {name.lower() for name, _ in commands}
+        for name, callback in extra:
+            if name.lower() not in known:
+                commands.append((name, callback))
+        return sorted(commands, key=lambda item: item[0].casefold())
+
+    def show_command_palette(self):
+        """Open a searchable command picker inspired by VS Code's Ctrl+Shift+P."""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Befehlspalette")
+        dialog.setMinimumSize(650, 460)
+        dialog.resize(760, 540)
+        layout = QVBoxLayout(dialog)
+        search = QLineEdit(dialog)
+        search.setPlaceholderText("Befehl eingeben, z. B. 'speichern', 'Ollama', 'Payload prüfen' …")
+        search.setClearButtonEnabled(True)
+        layout.addWidget(search)
+        listing = QListWidget(dialog)
+        listing.setUniformItemSizes(True)
+        layout.addWidget(listing, 1)
+        commands = self._collect_command_actions()
+        def populate(query=""):
+            query = query.strip().casefold()
+            listing.clear()
+            for label, target in commands:
+                if query in label.casefold():
+                    item = QListWidgetItem(label)
+                    item.setData(Qt.ItemDataRole.UserRole, target)
+                    listing.addItem(item)
+            if listing.count():
+                listing.setCurrentRow(0)
+        def execute_current():
+            item = listing.currentItem()
+            if item is None:
+                return
+            target = item.data(Qt.ItemDataRole.UserRole)
+            dialog.accept()
+            if isinstance(target, QAction):
+                target.trigger()
+            else:
+                target()
+        search.textChanged.connect(populate)
+        search.returnPressed.connect(execute_current)
+        listing.itemActivated.connect(lambda _item: execute_current())
+        listing.itemDoubleClicked.connect(lambda _item: execute_current())
+        populate()
+        search.setFocus()
+        dialog.exec()
+
     def action(self,label,callback,menu,shortcut=None):
         a=QAction(label,self); a.triggered.connect(lambda _checked=False, cb=callback: cb())
         if shortcut: a.setShortcut(QKeySequence(shortcut))
@@ -1986,64 +2096,195 @@ class BadUSBIDE(QMainWindow):
         cur.insertText('\n'.join(result))
         cur.endEditBlock()
     def addon_directory(self):
-        d=Path.home()/'.badusb_ide_addons'
+        d=Path.home()/".badusb_ide_addons"
         d.mkdir(parents=True,exist_ok=True)
         return d
+
+    def marketplace_directory(self):
+        d=self.addon_directory()/"marketplace"
+        d.mkdir(parents=True,exist_ok=True)
+        return d
+
+    def _plugin_files(self):
+        root=self.addon_directory()
+        return sorted((p for p in root.rglob("*.py") if not any(x.startswith(".") or x in {"__pycache__", ".git"} for x in p.relative_to(root).parts) and not p.name.startswith("_") and p.name != "setup.py"), key=lambda p:str(p).lower())
+
+    def _plugin_key(self,path):
+        return str(Path(path).resolve())
+
+    def _load_enabled_addons(self):
+        for path in self.settings.get("enabled_addons", []):
+            try:
+                if Path(path).is_file(): self._activate_addon(Path(path), show_errors=False)
+            except Exception: pass
+
+    def _activate_addon(self,path,show_errors=True):
+        path=Path(path).resolve(); key=self._plugin_key(path)
+        if key in self.addon_records: return True
+        spec=importlib.util.spec_from_file_location("badusb_addon_"+re.sub(r"\W","_",path.stem)+"_"+str(abs(hash(key))),path)
+        if not spec or not spec.loader: raise RuntimeError("Python-Modul konnte nicht geladen werden.")
+        module=importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+        register=getattr(module,"register",None)
+        if not callable(register): raise ValueError("Plugin benötigt eine register(ide)-Funktion.")
+        old_actions=set(self.addon_actions); old_docks=set(self.addon_docks)
+        register(self)
+        actions=[x for x in self.addon_actions if x not in old_actions]
+        docks=[x for x in self.addon_docks if x not in old_docks]
+        name=getattr(module,"ADDON_NAME",path.stem)
+        self.addon_records[key]={"path":path,"module":module,"actions":actions,"docks":docks,"name":name}
+        if module not in self.addon_modules: self.addon_modules.append(module)
+        enabled=self.settings.setdefault("enabled_addons",[])
+        if key not in enabled: enabled.append(key)
+        self.save_settings(); self.statusBar().showMessage("Plugin aktiviert: "+name)
+        return True
+
+    def _deactivate_addon(self,path):
+        key=self._plugin_key(path); rec=self.addon_records.get(key)
+        if not rec: return
+        module=rec["module"]
+        cleanup=getattr(module,"unregister",None)
+        if callable(cleanup):
+            try: cleanup(self)
+            except Exception as ex: QMessageBox.warning(self,"Plugin-Aufräumen",str(ex))
+        for act in rec["actions"]:
+            try:
+                parent=act.parent()
+                if isinstance(parent,QMenu): parent.removeAction(act)
+                if hasattr(self,"main_toolbar"): self.main_toolbar.removeAction(act)
+                act.setEnabled(False); act.deleteLater()
+            except Exception: pass
+            if act in self.addon_actions: self.addon_actions.remove(act)
+        for dock in rec["docks"]:
+            try: self.removeDockWidget(dock); dock.close(); dock.deleteLater()
+            except Exception: pass
+            if dock in self.addon_docks: self.addon_docks.remove(dock)
+        self.addon_records.pop(key,None)
+        self.addon_modules=[m for m in self.addon_modules if m is not module]
+        self.settings["enabled_addons"]=[x for x in self.settings.get("enabled_addons",[]) if self._plugin_key(x)!=key]
+        self.save_settings(); self.statusBar().showMessage("Plugin deaktiviert: "+rec["name"])
+
     def open_addon_folder(self):
-        import os
         path=self.addon_directory()
         try:
-            if sys.platform.startswith('win'): os.startfile(str(path))
-            elif sys.platform=='darwin': import subprocess; subprocess.Popen(['open',str(path)])
-            else: import subprocess; subprocess.Popen(['xdg-open',str(path)])
-        except Exception as ex: QMessageBox.warning(self,'Add-on-Ordner',f'{path}\n{ex}')
-    def register_menu(self,name,parent='Erweiterungen'):
-        parent_menu=self.extensions_menu if parent in (None,'Erweiterungen') else None
+            if sys.platform.startswith("win"): os.startfile(str(path))
+            elif sys.platform=="darwin": subprocess.Popen(["open",str(path)])
+            else: subprocess.Popen(["xdg-open",str(path)])
+        except Exception as ex: QMessageBox.warning(self,"Add-on-Ordner",str(path)+"\n"+str(ex))
+
+    def register_menu(self,name,parent="Erweiterungen"):
+        parent_menu=self.extensions_menu if parent in (None,"Erweiterungen") else None
         if parent_menu is None:
             for a in self.extensions_menu.actions():
                 if a.menu() and a.text()==parent: parent_menu=a.menu(); break
         if parent_menu is None: parent_menu=self.extensions_menu
-        menu=parent_menu.addMenu(name)
-        return menu
-    def register_menu_action(self,label,callback,menu='Erweiterungen',accelerator=None):
+        return parent_menu.addMenu(name)
+
+    def register_menu_action(self,label,callback,menu="Erweiterungen",accelerator=None):
         target=self.extensions_menu
         for a in self.extensions_menu.actions():
             if a.menu() and a.text()==menu: target=a.menu(); break
         act=QAction(label,self); act.triggered.connect(lambda _=False,cb=callback:cb())
         if accelerator:
-            try:act.setShortcut(QKeySequence(accelerator))
-            except Exception:pass
-        target.addAction(act)
-        self.addon_actions.append(act)
-        return act
-    def register_toolbar_button(self,label,callback,tooltip=''):
-        if not hasattr(self,'main_toolbar'): return None
+            try: act.setShortcut(QKeySequence(accelerator))
+            except Exception: pass
+        target.addAction(act); self.addon_actions.append(act); return act
+
+    def register_toolbar_button(self,label,callback,tooltip=""):
+        if not hasattr(self,"main_toolbar"): return None
         act=QAction(label,self); act.setToolTip(tooltip or label); act.triggered.connect(lambda _=False,cb=callback:cb()); self.main_toolbar.addAction(act); self.addon_actions.append(act); return act
+
     def register_panel(self,name,builder):
-        # PyQt port: add-ons may supply a callable that creates/returns a QWidget.
         try:
             widget=builder(self,self)
             if isinstance(widget,QWidget):
-                dock=QDockWidget(name,self)
-                dock.setWidget(widget)
-                self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea,dock)
-                return dock
-            QMessageBox.information(self,'Add-on',f'{name}: Builder muss ein PyQt6-QWidget zurückgeben.')
-        except Exception as ex: QMessageBox.warning(self,'Add-on-Panel',str(ex))
+                dock=QDockWidget(name,self); dock.setObjectName("addon_dock_"+re.sub(r"\W","_",name)); dock.setWidget(widget)
+                dock.setFeatures(QDockWidget.DockWidgetFeature.DockWidgetMovable|QDockWidget.DockWidgetFeature.DockWidgetFloatable|QDockWidget.DockWidgetFeature.DockWidgetClosable)
+                self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea,dock); self.addon_docks.append(dock); return dock
+            QMessageBox.information(self,"Add-on",name+": Builder muss ein PyQt6-QWidget zurückgeben.")
+        except Exception as ex: QMessageBox.warning(self,"Add-on-Panel",str(ex))
+
     def load_addon(self):
-        path,_=QFileDialog.getOpenFileName(self,'Python-Add-on laden',str(self.addon_directory()),'Python-Dateien (*.py)')
-        if not path:return
+        path,_=QFileDialog.getOpenFileName(self,"Python-Add-on laden",str(self.addon_directory()),"Python-Dateien (*.py)")
+        if not path: return
         try:
-            spec=importlib.util.spec_from_file_location('badusb_addon_'+Path(path).stem,path)
-            if not spec or not spec.loader:raise RuntimeError('Python-Modul konnte nicht geladen werden.')
-            module=importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-            register=getattr(module,'register',None)
-            if not callable(register):raise ValueError('Add-on muss eine register(ide)-Funktion bereitstellen.')
-            register(self)
-            self.addon_modules.append(module)
-            self.statusBar().showMessage('Add-on geladen: '+getattr(module,'ADDON_NAME',Path(path).stem))
-        except Exception as ex: QMessageBox.critical(self,'Add-on fehlgeschlagen',f'{ex}\n\n{traceback.format_exc()}')
+            if QMessageBox.question(self,"Plugin-Code ausführen?","Python-Plugins können Dateien, Netzwerk und andere Ressourcen mit deinen Benutzerrechten verwenden. Nur vertrauenswürdige Plugins aktivieren.\n\nFortfahren?") != QMessageBox.StandardButton.Yes: return
+            self._activate_addon(Path(path))
+        except Exception as ex: QMessageBox.critical(self,"Add-on fehlgeschlagen",str(ex)+"\n\n"+traceback.format_exc())
+
+    def show_plugin_manager(self):
+        dlg=QDialog(self); dlg.setWindowTitle("Plugin-Verwaltung und Git-Marktplatz"); dlg.resize(900,650); dlg.setMinimumSize(760,520)
+        root=QVBoxLayout(dlg)
+        warning=QLabel("Plugins können Menüs, Werkzeuge, Panels und eigene Einstellungen bereitstellen. Python-Plugins werden mit deinen Benutzerrechten ausgeführt. Installiere nur vertrauenswürdige Repositories."); warning.setWordWrap(True); root.addWidget(warning)
+        tabs=QTabWidget(); root.addWidget(tabs,1)
+        page=QWidget(); lay=QVBoxLayout(page)
+        table=QTableWidget(0,3); table.setHorizontalHeaderLabels(["Status","Plugin","Dateipfad"]); table.horizontalHeader().setStretchLastSection(True); table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows); table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers); lay.addWidget(table,1)
+        row=QHBoxLayout(); buttons={}
+        for label in ("Aktualisieren","Aktivieren","Deaktivieren","Einstellungen…","Datei löschen…"):
+            b=QPushButton(label); row.addWidget(b); buttons[label]=b
+        lay.addLayout(row); tabs.addTab(page,"Installierte Plugins")
+        market=QWidget(); ml=QVBoxLayout(market); ml.addWidget(QLabel("Git-Repository als Marktplatzquelle klonen oder aktualisieren. Git muss installiert sein."))
+        urlrow=QHBoxLayout(); url=QLineEdit(); url.setPlaceholderText("https://github.com/benutzer/plugin-repository.git"); install=QPushButton("Repository hinzufügen / aktualisieren"); urlrow.addWidget(url,1); urlrow.addWidget(install); ml.addLayout(urlrow)
+        update=QPushButton("Alle Marktplatz-Repositories aktualisieren"); ml.addWidget(update)
+        log=QPlainTextEdit(); log.setReadOnly(True); ml.addWidget(log,1); ml.addWidget(QLabel("Plugin-Dateien müssen register(ide) bereitstellen. Optional: ADDON_NAME und configure(ide) für Plugin-Einstellungen.")); tabs.addTab(market,"Git-Marktplatz")
+        def selected():
+            r=table.currentRow(); item=table.item(r,2) if r>=0 else None
+            return Path(item.data(Qt.ItemDataRole.UserRole)) if item else None
+        def fill():
+            table.setRowCount(0); enabled={self._plugin_key(x) for x in self.settings.get("enabled_addons",[]) if isinstance(x,str)}
+            for path in self._plugin_files():
+                key=self._plugin_key(path); r=table.rowCount(); table.insertRow(r); rec=self.addon_records.get(key)
+                table.setItem(r,0,QTableWidgetItem("Aktiviert" if key in enabled else "Deaktiviert")); table.setItem(r,1,QTableWidgetItem(rec["name"] if rec else path.stem)); item=QTableWidgetItem(str(path)); item.setData(Qt.ItemDataRole.UserRole,str(path)); table.setItem(r,2,item)
+            table.resizeColumnsToContents()
+        def activate():
+            path=selected()
+            if not path:return
+            if QMessageBox.question(dlg,"Plugin aktivieren?","Der Python-Code wird mit deinen Benutzerrechten ausgeführt. Nur vertrauenswürdigen Code aktivieren.") != QMessageBox.StandardButton.Yes:return
+            try:self._activate_addon(path); fill()
+            except Exception as ex:QMessageBox.critical(dlg,"Aktivierung fehlgeschlagen",str(ex)+"\n\n"+traceback.format_exc())
+        def deactivate():
+            path=selected()
+            if path:self._deactivate_addon(path); fill()
+        def configure():
+            path=selected(); rec=self.addon_records.get(self._plugin_key(path)) if path else None
+            if not rec:QMessageBox.information(dlg,"Plugin-Einstellungen","Aktiviere das Plugin zuerst."); return
+            fn=getattr(rec["module"],"configure",None) or getattr(rec["module"],"open_settings",None)
+            if not callable(fn):QMessageBox.information(dlg,"Keine Einstellungen","Dieses Plugin stellt keine configure(ide)- oder open_settings(ide)-Funktion bereit."); return
+            try:fn(self)
+            except Exception as ex:QMessageBox.critical(dlg,"Einstellungen fehlgeschlagen",str(ex))
+        def delete_plugin():
+            path=selected()
+            if not path:return
+            if QMessageBox.question(dlg,"Plugin-Datei löschen?","Datei wirklich löschen?\n"+str(path)) != QMessageBox.StandardButton.Yes:return
+            if self._plugin_key(path) in self.addon_records:self._deactivate_addon(path)
+            try:path.unlink(); fill()
+            except Exception as ex:QMessageBox.warning(dlg,"Löschen fehlgeschlagen",str(ex))
+        def git_repo(repo_path):
+            result=subprocess.run(["git","-C",str(repo_path),"pull","--ff-only"],capture_output=True,text=True,timeout=180) if (repo_path/".git").is_dir() else None
+            if result is None:return subprocess.run(["git","clone","--depth","1",url.text().strip(),str(repo_path)],capture_output=True,text=True,timeout=240)
+            return result
+        def install_repo():
+            repo=url.text().strip()
+            if not (repo.startswith("https://") or repo.startswith("ssh://") or repo.startswith("git@")):
+                QMessageBox.warning(dlg,"Repository-URL","Bitte eine HTTPS- oder SSH-Git-URL eingeben."); return
+            if not shutil.which("git"):QMessageBox.warning(dlg,"Git fehlt","Installiere Git und stelle sicher, dass git im PATH liegt."); return
+            name=Path(repo.rstrip("/").removesuffix(".git")).name; name=re.sub(r"[^A-Za-z0-9_.-]","_",name) or "plugin_repo"; dest=self.marketplace_directory()/name
+            try:
+                result=git_repo(dest); out=(result.stdout+"\n"+result.stderr).strip(); log.appendPlainText("Repository: "+repo+"\n"+out)
+                if result.returncode:QMessageBox.warning(dlg,"Git fehlgeschlagen",out)
+                else:QMessageBox.information(dlg,"Repository geladen","Repository wurde geladen. Prüfe seine Dateien und aktiviere vertrauenswürdige Plugins im ersten Tab.")
+                fill()
+            except Exception as ex:QMessageBox.warning(dlg,"Git-Fehler",str(ex))
+        def update_repos():
+            if not shutil.which("git"):QMessageBox.warning(dlg,"Git fehlt","Installiere Git zuerst."); return
+            for repo in self.marketplace_directory().iterdir():
+                if repo.is_dir() and (repo/".git").is_dir():
+                    try:
+                        r=subprocess.run(["git","-C",str(repo),"pull","--ff-only"],capture_output=True,text=True,timeout=180); log.appendPlainText(repo.name+": "+r.stdout+" "+r.stderr)
+                    except Exception as ex:log.appendPlainText(repo.name+": "+str(ex))
+            fill()
+        buttons["Aktualisieren"].clicked.connect(fill); buttons["Aktivieren"].clicked.connect(activate); buttons["Deaktivieren"].clicked.connect(deactivate); buttons["Einstellungen…"].clicked.connect(configure); buttons["Datei löschen…"].clicked.connect(delete_plugin); install.clicked.connect(install_repo); update.clicked.connect(update_repos); table.cellDoubleClicked.connect(lambda *_:configure())
+        fill(); bb=QDialogButtonBox(QDialogButtonBox.StandardButton.Close); bb.rejected.connect(dlg.reject); root.addWidget(bb); dlg.exec()
+
     def disconnect_flipper(self):
         try:
             if self.serial_conn and self.serial_conn.is_open: self.serial_conn.close()
