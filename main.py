@@ -16,6 +16,7 @@ import time
 import traceback
 import urllib.request
 import urllib.error
+import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -2446,6 +2447,7 @@ class BadUSBIDE(QMainWindow):
         warning=QLabel("Plugins können Menüs, Werkzeuge, Panels und eigene Einstellungen bereitstellen. Python-Plugins werden mit deinen Benutzerrechten ausgeführt. Installiere nur vertrauenswürdige Repositories."); warning.setWordWrap(True); root.addWidget(warning)
         tabs=QTabWidget(); root.addWidget(tabs,1)
         page=QWidget(); lay=QVBoxLayout(page)
+        installed_search=QLineEdit(); installed_search.setPlaceholderText("Installierte Plugins lokal suchen: Name, Status oder Dateipfad …"); lay.addWidget(installed_search)
         table=QTableWidget(0,3); table.setHorizontalHeaderLabels(["Status","Plugin","Dateipfad"]); table.horizontalHeader().setStretchLastSection(True); table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows); table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers); lay.addWidget(table,1)
         row=QHBoxLayout(); buttons={}
         for label in ("Aktualisieren","Aktivieren","Deaktivieren","Einstellungen…","Datei löschen…"):
@@ -2454,13 +2456,66 @@ class BadUSBIDE(QMainWindow):
         market=QWidget(); ml=QVBoxLayout(market); ml.addWidget(QLabel("Git-Repository als Marktplatzquelle klonen oder aktualisieren. Git muss installiert sein."))
         urlrow=QHBoxLayout(); url=QLineEdit(); url.setPlaceholderText("https://github.com/benutzer/plugin-repository.git"); install=QPushButton("Repository hinzufügen / aktualisieren"); urlrow.addWidget(url,1); urlrow.addWidget(install); ml.addLayout(urlrow)
         update=QPushButton("Alle Marktplatz-Repositories aktualisieren"); ml.addWidget(update)
+        repo_search=QLineEdit(); repo_search.setPlaceholderText("Lokal suchen: Marketplace-Name oder Repository-URL …"); ml.addWidget(repo_search)
         repo_table=QTableWidget(0,3); repo_table.setHorizontalHeaderLabels(["Marketplace", "Letzter Commit", "Repository-URL"]); repo_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows); repo_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers); repo_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection); repo_table.horizontalHeader().setStretchLastSection(True); ml.addWidget(repo_table,1)
+        remote_repo_toggle=QPushButton("＋ Remote-GitHub-Suche anzeigen")
+        remote_repo_toggle.setCheckable(True)
+        ml.addWidget(remote_repo_toggle)
+        remote_repo_panel=QWidget(); remote_repo_layout=QVBoxLayout(remote_repo_panel); remote_repo_layout.setContentsMargins(0,0,0,0)
+        remote_repo_row=QHBoxLayout(); remote_repo_search=QLineEdit(); remote_repo_search.setPlaceholderText("Remote auf GitHub suchen (z. B. Flipper Zero BadUSB)"); remote_repo_button=QPushButton("Remote suchen"); remote_repo_row.addWidget(remote_repo_search,1); remote_repo_row.addWidget(remote_repo_button); remote_repo_layout.addLayout(remote_repo_row)
+        remote_repo_table=QTableWidget(0,3); remote_repo_table.setHorizontalHeaderLabels(["GitHub-Repository", "Beschreibung", "URL"]); remote_repo_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows); remote_repo_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers); remote_repo_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection); remote_repo_table.horizontalHeader().setStretchLastSection(True); remote_repo_table.setMaximumHeight(150); remote_repo_layout.addWidget(remote_repo_table)
+        remote_add_button=QPushButton("Ausgewähltes Remote-Repository als Marketplace hinzufügen"); remote_repo_layout.addWidget(remote_add_button)
+        remote_repo_panel.setVisible(False); ml.addWidget(remote_repo_panel)
         repo_buttons=QHBoxLayout(); repo_readme_button=QPushButton("Marketplace-README ansehen"); repo_remove_button=QPushButton("Ausgewählten Marketplace entfernen"); repo_buttons.addWidget(repo_readme_button); repo_buttons.addWidget(repo_remove_button); ml.addLayout(repo_buttons)
         log=QPlainTextEdit(); log.setReadOnly(True); log.setMaximumHeight(100); ml.addWidget(log); ml.addWidget(QLabel("Plugin-Dateien müssen register(ide) bereitstellen. Optional: ADDON_NAME, VERSION und configure(ide).")); tabs.addTab(market,"Git-Marktplatz")
         store=QWidget(); sl=QVBoxLayout(store)
-        sl.addWidget(QLabel("Durchsuche geklonte Marketplace-Quellen. Nur Python-Dateien mit einer register(ide)-Funktion sind als IDE-Plugins geeignet."))
+        sl.addWidget(QLabel("Durchsuche die lokal geladenen Marketplace-Inhalte. Neue GitHub-Repositorys findest du im Tab ‚Git-Marktplatz‘ über die einklappbare Remote-Suche."))
+        store_search=QLineEdit(); store_search.setPlaceholderText("Lokal suchen: Plugin-Name, Typ, Version oder Marketplace …"); sl.addWidget(store_search)
         store_table=QTableWidget(0,5); store_table.setHorizontalHeaderLabels(["Name", "Typ", "Version", "Marketplace", "Letzter Commit"]); store_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows); store_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers); store_table.horizontalHeader().setStretchLastSection(True); store_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection); sl.addWidget(store_table,1)
         sr=QHBoxLayout(); refresh_store_button=QPushButton("Katalog aktualisieren"); readme_button=QPushButton("README ansehen"); install_selected_button=QPushButton("Ausgewähltes Plugin installieren"); remove_source_button=QPushButton("Marketplace-Quelle entfernen"); sr.addWidget(refresh_store_button); sr.addWidget(readme_button); sr.addWidget(install_selected_button); sr.addWidget(remove_source_button); sl.addLayout(sr); tabs.addTab(store,"Marketplace-Inhalte")
+        def apply_table_filter(table_widget, query, columns=None):
+            needle = (query or "").strip().casefold()
+            for row_index in range(table_widget.rowCount()):
+                indexes = columns if columns is not None else range(table_widget.columnCount())
+                haystack = " ".join(table_widget.item(row_index, col).text() for col in indexes if table_widget.item(row_index, col))
+                table_widget.setRowHidden(row_index, bool(needle) and needle not in haystack.casefold())
+
+        def search_github_repositories(query, result_table):
+            query = (query or "").strip()
+            if not query:
+                QMessageBox.information(dlg, "Remote-Suche", "Gib einen Suchbegriff ein.")
+                return
+            result_table.setRowCount(0)
+            try:
+                params = urllib.parse.urlencode({"q": query, "sort": "updated", "order": "desc", "per_page": 30})
+                request = urllib.request.Request("https://api.github.com/search/repositories?" + params,
+                    headers={"Accept": "application/vnd.github+json", "User-Agent": "BadUSB-IDE-Marketplace"})
+                with urllib.request.urlopen(request, timeout=15) as response:
+                    payload = json.loads(response.read().decode("utf-8", errors="replace"))
+                for repo_info in payload.get("items", []):
+                    r = result_table.rowCount(); result_table.insertRow(r)
+                    name = QTableWidgetItem(repo_info.get("full_name", "Unbekannt"))
+                    name.setData(Qt.ItemDataRole.UserRole, repo_info.get("clone_url") or repo_info.get("html_url", ""))
+                    result_table.setItem(r, 0, name)
+                    result_table.setItem(r, 1, QTableWidgetItem(repo_info.get("description") or "Keine Beschreibung"))
+                    result_table.setItem(r, 2, QTableWidgetItem(repo_info.get("html_url", "")))
+                result_table.resizeColumnsToContents()
+                if result_table.rowCount() == 0:
+                    QMessageBox.information(dlg, "Remote-Suche", "GitHub hat keine passenden Repositorys gefunden.")
+            except Exception as exc:
+                QMessageBox.warning(dlg, "Remote-Suche fehlgeschlagen", f"GitHub-Suche nicht möglich:\n{exc}\n\nPrüfe die Internetverbindung oder das GitHub-API-Limit.")
+
+        def add_remote_repository(result_table):
+            row_index = result_table.currentRow()
+            item = result_table.item(row_index, 0) if row_index >= 0 else None
+            remote_url = item.data(Qt.ItemDataRole.UserRole) if item else ""
+            if not remote_url:
+                QMessageBox.information(dlg, "Marketplace hinzufügen", "Wähle zuerst ein Remote-Repository aus.")
+                return
+            url.setText(remote_url)
+            tabs.setCurrentWidget(market)
+            install.click()
+
         def repo_last_commit(repo_path):
             if not shutil.which("git") or not (Path(repo_path) / ".git").is_dir():
                 return "Unbekannt"
@@ -2769,6 +2824,15 @@ class BadUSBIDE(QMainWindow):
         refresh_store_button.clicked.connect(lambda: refresh_store(fetch_updates=True)); readme_button.clicked.connect(show_store_readme); install_selected_button.clicked.connect(install_store_plugin); remove_source_button.clicked.connect(remove_marketplace_source); store_table.cellDoubleClicked.connect(lambda _row, _column: show_store_readme())
         repo_readme_button.clicked.connect(show_marketplace_readme); repo_remove_button.clicked.connect(remove_selected_marketplace); repo_table.cellDoubleClicked.connect(lambda _row, _column: show_marketplace_readme())
         buttons["Aktualisieren"].clicked.connect(fill); buttons["Aktivieren"].clicked.connect(activate); buttons["Deaktivieren"].clicked.connect(deactivate); buttons["Einstellungen…"].clicked.connect(configure); buttons["Datei löschen…"].clicked.connect(delete_plugin); install.clicked.connect(install_repo); update.clicked.connect(update_repos); table.cellDoubleClicked.connect(lambda *_:configure())
+        repo_search.textChanged.connect(lambda value: apply_table_filter(repo_table, value))
+        store_search.textChanged.connect(lambda value: apply_table_filter(store_table, value))
+        installed_search.textChanged.connect(lambda value: apply_table_filter(table, value))
+        remote_repo_button.clicked.connect(lambda: search_github_repositories(remote_repo_search.text(), remote_repo_table))
+        def toggle_remote_repo_search(expanded):
+            remote_repo_panel.setVisible(expanded)
+            remote_repo_toggle.setText("− Remote-GitHub-Suche ausblenden" if expanded else "＋ Remote-GitHub-Suche anzeigen")
+        remote_repo_toggle.toggled.connect(toggle_remote_repo_search)
+        remote_add_button.clicked.connect(lambda: add_remote_repository(remote_repo_table))
         fill(); fill_marketplaces(); refresh_store(); bb=QDialogButtonBox(QDialogButtonBox.StandardButton.Close); bb.rejected.connect(dlg.reject); root.addWidget(bb); dlg.exec()
 
     def disconnect_flipper(self):
