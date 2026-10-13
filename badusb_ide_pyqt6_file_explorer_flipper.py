@@ -653,6 +653,14 @@ class BadUSBIDE(QMainWindow):
         self.settings.setdefault('confirm_before_close', True)
         self.settings.setdefault('default_extension', '.txt')
         self.settings.setdefault('remember_window_size', True)
+        self.settings.setdefault('font_family', 'Consolas')
+        self.settings.setdefault('tab_width', 4)
+        self.settings.setdefault('word_wrap', False)
+        self.settings.setdefault('output_max_blocks', 1500)
+        self.settings.setdefault('show_commands', True)
+        self.settings.setdefault('show_ollama', False)
+        self.settings.setdefault('show_file_explorer', True)
+        self.settings.setdefault('show_status_bar', True)
         self.theme_name=self.settings.get('theme','Flipper Amber')
         self.theme=THEMES.get(self.theme_name,THEMES['Flipper Amber']).copy()
         self.docs={}
@@ -677,8 +685,10 @@ class BadUSBIDE(QMainWindow):
             self.settings['theme'] = self.theme_name
             if hasattr(self, 'palette'):
                 self.settings['palette_collapsed'] = self.palette.isHidden()
-            if hasattr(self, 'mcp_panel'):
-                self.settings['ollama_panel_collapsed'] = self.mcp_panel.isHidden()
+            if hasattr(self, 'ollama_dock'):
+                self.settings['ollama_panel_collapsed'] = not self.ollama_dock.isVisible()
+            if hasattr(self, 'output_dock'):
+                self.settings['show_output'] = self.output_dock.isVisible()
             if hasattr(self, 'ollama_url'):
                 self.settings['ollama_url'] = self.ollama_url.text().strip()
             if hasattr(self, 'ollama_model'):
@@ -688,6 +698,7 @@ class BadUSBIDE(QMainWindow):
                 self.settings['output_height'] = self.output.maximumHeight()
             if self.settings.get('remember_window_size', True):
                 self.settings['window_size'] = [self.width(), self.height()]
+                self.settings['dock_state'] = bytes(self.saveState()).hex()
             self.settings_path.write_text(json.dumps(self.settings, indent=2), encoding='utf-8')
         except OSError:
             pass
@@ -713,18 +724,32 @@ class BadUSBIDE(QMainWindow):
             self.refresh_local_file_explorer(doc.path.parent)
 
     def apply_preferences(self):
+        if hasattr(self, 'output_dock'):
+            self.output_dock.setVisible(bool(self.settings.get('show_output', True)))
+        if hasattr(self, 'palette_dock'):
+            self.palette_dock.setVisible(bool(self.settings.get('show_commands', True)))
+        if hasattr(self, 'ollama_dock'):
+            self.ollama_dock.setVisible(bool(self.settings.get('show_ollama', not self.settings.get('ollama_panel_collapsed', True))))
+        if hasattr(self, 'file_explorer_dock'):
+            self.file_explorer_dock.setVisible(bool(self.settings.get('show_file_explorer', True)))
+        if hasattr(self, 'statusBar'):
+            self.statusBar().setVisible(bool(self.settings.get('show_status_bar', True)))
         if hasattr(self, 'output'):
-            self.output.setVisible(bool(self.settings.get('show_output', True)))
-            self.output.setMaximumHeight(max(60, min(600, int(self.settings.get('output_height', 130)))))
-        if hasattr(self, 'palette'):
-            collapsed = bool(self.settings.get('palette_collapsed', False))
-            self.palette.setVisible(not collapsed)
-            self.palette_search.setVisible(not collapsed)
-            if hasattr(self, 'palette_toggle'):
-                self.palette_toggle.setText('▶ Befehle' if collapsed else '▼ Befehle')
+            self.output.setMaximumBlockCount(int(self.settings.get('output_max_blocks', 1500)))
+        if hasattr(self, 'ollama_url'):
+            self.ollama_url.setText(self.settings.get('ollama_url', 'http://localhost:11434'))
+        if hasattr(self, 'ollama_model'):
+            self.ollama_model.setCurrentText(self.settings.get('ollama_model', ''))
         for editor in getattr(self, 'docs', {}).keys():
             editor._suggestions_enabled = bool(self.settings.get('autocomplete', True))
-            editor.setFont(QFont('Consolas', int(self.settings.get('font_size', 11))))
+            editor.setFont(QFont(self.settings.get('font_family', 'Consolas'), int(self.settings.get('font_size', 11))))
+            editor.setTabStopDistance(editor.fontMetrics().horizontalAdvance(' ') * int(self.settings.get('tab_width', 4)))
+            editor.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth if self.settings.get('word_wrap', False) else QPlainTextEdit.LineWrapMode.NoWrap)
+            editor.highlight_current_line = editor.highlight_current_line
+            if not self.settings.get('highlight_current_line', True):
+                editor.setExtraSelections([])
+            else:
+                editor.highlight_current_line()
     def _build_ui(self):
         self.setDockNestingEnabled(True)
         tb=QToolBar("Hauptwerkzeuge")
@@ -740,34 +765,52 @@ class BadUSBIDE(QMainWindow):
         self.theme_combo.setCurrentText(self.theme_name)
         self.theme_combo.currentTextChanged.connect(self.change_theme)
         tb.addWidget(self.theme_combo)
-        split=QSplitter(Qt.Orientation.Horizontal)
-        self.setCentralWidget(split)
-        left=QWidget()
-        ll=QVBoxLayout(left)
-        ll.setContentsMargins(8,8,8,8)
+        # The editor is the central workspace. Tool panels are independent docks,
+        # so they can be hidden, floated, tabified, or moved to any dock area.
+        self.tabs=QTabWidget()
+        self.tabs.setTabsClosable(True)
+        self.tabs.setMovable(True)
+        self.tabs.setDocumentMode(True)
+        self.tabs.tabCloseRequested.connect(self.close_tab)
+        self.tabs.currentChanged.connect(self.on_current_tab_changed)
+        self.tabs.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.tabs.customContextMenuRequested.connect(self.tab_context_menu)
+        self.setCentralWidget(self.tabs)
+
+        # Command palette dock: expanding/collapsing the tree only affects its contents;
+        # the whole panel itself is shown/hidden from the View menu or its dock close button.
+        self.palette_dock = QDockWidget("Befehle", self)
+        self.palette_dock.setObjectName("CommandPaletteDock")
+        self.palette_dock.setFeatures(QDockWidget.DockWidgetFeature.DockWidgetMovable | QDockWidget.DockWidgetFeature.DockWidgetFloatable | QDockWidget.DockWidgetFeature.DockWidgetClosable)
+        self.palette_dock.setAllowedAreas(Qt.DockWidgetArea.AllDockWidgetAreas)
+        palette_panel = QWidget()
+        palette_layout = QVBoxLayout(palette_panel)
+        palette_layout.setContentsMargins(6, 6, 6, 6)
         self.palette_toggle = QPushButton('▼ Befehle')
         self.palette_toggle.setCheckable(True)
         self.palette_toggle.setChecked(not bool(self.settings.get('palette_collapsed', False)))
         self.palette_toggle.clicked.connect(self.toggle_palette)
-        ll.addWidget(self.palette_toggle)
-        self.palette_search=QLineEdit()
+        palette_layout.addWidget(self.palette_toggle)
+        self.palette_search = QLineEdit()
         self.palette_search.setPlaceholderText("Befehl suchen …")
         self.palette_search.textChanged.connect(self.filter_palette)
-        ll.addWidget(self.palette_search)
-        self.palette=QTreeWidget()
+        palette_layout.addWidget(self.palette_search)
+        self.palette = QTreeWidget()
         self.palette.setHeaderHidden(True)
         self.palette.itemDoubleClicked.connect(self.insert_palette_item)
-        ll.addWidget(self.palette,1)
+        palette_layout.addWidget(self.palette, 1)
+        self.palette_dock.setWidget(palette_panel)
+        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.palette_dock)
         self._populate_palette()
 
-        self.mcp_toggle = QPushButton('▶ Lokale KI (Ollama)')
-        self.mcp_toggle.setCheckable(True)
-        self.mcp_toggle.setChecked(not bool(self.settings.get('ollama_panel_collapsed', True)))
-        self.mcp_toggle.clicked.connect(self.toggle_mcp_panel)
-        ll.addWidget(self.mcp_toggle)
+        # Ollama is a separate dock rather than an expandable section in the command panel.
+        self.ollama_dock = QDockWidget("Lokale KI (Ollama)", self)
+        self.ollama_dock.setObjectName("OllamaDock")
+        self.ollama_dock.setFeatures(QDockWidget.DockWidgetFeature.DockWidgetMovable | QDockWidget.DockWidgetFeature.DockWidgetFloatable | QDockWidget.DockWidgetFeature.DockWidgetClosable)
+        self.ollama_dock.setAllowedAreas(Qt.DockWidgetArea.AllDockWidgetAreas)
         self.mcp_panel = QWidget()
         mcp_layout = QVBoxLayout(self.mcp_panel)
-        mcp_layout.setContentsMargins(4, 2, 4, 4)
+        mcp_layout.setContentsMargins(6, 6, 6, 6)
         self.ollama_url = QLineEdit(self.settings.get('ollama_url', 'http://localhost:11434'))
         self.ollama_url.setPlaceholderText('Ollama URL, z. B. http://localhost:11434')
         self.ollama_url.setToolTip('Lokale Ollama-API-Adresse. Standard: http://localhost:11434')
@@ -786,7 +829,7 @@ class BadUSBIDE(QMainWindow):
         mcp_layout.addLayout(model_row)
         self.ollama_prompt = QPlainTextEdit()
         self.ollama_prompt.setPlaceholderText('Frage stellen oder Code ändern lassen …')
-        self.ollama_prompt.setMaximumHeight(95)
+        self.ollama_prompt.setMaximumHeight(120)
         mcp_layout.addWidget(self.ollama_prompt)
         ollama_buttons = QHBoxLayout()
         self.ollama_send = QPushButton('KI fragen')
@@ -799,9 +842,7 @@ class BadUSBIDE(QMainWindow):
         self.ollama_answer = QPlainTextEdit()
         self.ollama_answer.setReadOnly(False)
         self.ollama_answer.setPlaceholderText('Antwort der lokalen KI …')
-        self.ollama_answer.setMinimumHeight(90)
-        self.ollama_answer.setMaximumHeight(190)
-        mcp_layout.addWidget(self.ollama_answer)
+        mcp_layout.addWidget(self.ollama_answer, 1)
         answer_buttons = QHBoxLayout()
         self.ollama_insert = QPushButton('Antwort einfügen')
         self.ollama_insert.clicked.connect(self.insert_ollama_answer)
@@ -813,34 +854,33 @@ class BadUSBIDE(QMainWindow):
         self.mcp_status = QLabel('Verbindung zur lokalen Ollama-API · kein MCP-Server erforderlich')
         self.mcp_status.setWordWrap(True)
         mcp_layout.addWidget(self.mcp_status)
-        self.mcp_panel.setVisible(not bool(self.settings.get('ollama_panel_collapsed', self.settings.get('mcp_collapsed', True))))
-        ll.addWidget(self.mcp_panel)
-        self.mcp_toggle.setText('▼ Lokale KI (Ollama)' if not self.mcp_panel.isHidden() else '▶ Lokale KI (Ollama)')
-        split.addWidget(left)
-        right=QWidget()
-        rl=QVBoxLayout(right)
-        rl.setContentsMargins(0,0,0,0)
-        self.tabs=QTabWidget()
-        self.tabs.setTabsClosable(True)
-        self.tabs.setMovable(True)
-        self.tabs.setDocumentMode(True)
-        self.tabs.tabCloseRequested.connect(self.close_tab)
-        self.tabs.currentChanged.connect(self.on_current_tab_changed)
-        self.tabs.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.tabs.customContextMenuRequested.connect(self.tab_context_menu)
-        rl.addWidget(self.tabs,1)
-        self.output=QPlainTextEdit()
+        self.ollama_dock.setWidget(self.mcp_panel)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.ollama_dock)
+        self.ollama_dock.setVisible(not bool(self.settings.get('ollama_panel_collapsed', True)))
+
+        # Output is also a dock, not a fixed-height widget below the editor.
+        self.output = QPlainTextEdit()
         self.output.setReadOnly(True)
         self.output.setMaximumBlockCount(1500)
         self.output.setPlaceholderText("Prüfergebnisse erscheinen hier …")
-        self.output.setMaximumHeight(130)
-        rl.addWidget(self.output)
-        split.addWidget(right)
-        split.setSizes([270,1080])
+        self.output_dock = QDockWidget("Output / Prüfung", self)
+        self.output_dock.setObjectName("OutputDock")
+        self.output_dock.setFeatures(QDockWidget.DockWidgetFeature.DockWidgetMovable | QDockWidget.DockWidgetFeature.DockWidgetFloatable | QDockWidget.DockWidgetFeature.DockWidgetClosable)
+        self.output_dock.setAllowedAreas(Qt.DockWidgetArea.AllDockWidgetAreas)
+        self.output_dock.setWidget(self.output)
+        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.output_dock)
+        self.output_dock.setVisible(bool(self.settings.get('show_output', True)))
+
+        self.setDockNestingEnabled(True)
+        self.setDockOptions(QMainWindow.DockOption.AllowNestedDocks | QMainWindow.DockOption.AllowTabbedDocks | QMainWindow.DockOption.AnimatedDocks | QMainWindow.DockOption.GroupedDragging)
         self.setStatusBar(QStatusBar())
         self.working_dir_label = QLabel()
         self.statusBar().addPermanentWidget(self.working_dir_label, 1)
         self._build_local_file_explorer()
+        saved_dock_state = self.settings.get('dock_state')
+        if saved_dock_state:
+            try: self.restoreState(bytes.fromhex(saved_dock_state))
+            except (ValueError, TypeError): pass
         if self.settings.get('remember_window_size', True):
             size = self.settings.get('window_size')
             if isinstance(size, list) and len(size) == 2:
@@ -1486,14 +1526,23 @@ class BadUSBIDE(QMainWindow):
             self.import_selected_as_project_folder()
 
     def toggle_mcp_panel(self, checked=None):
-        expanded = self.mcp_toggle.isChecked() if checked is None else bool(checked)
-        self.mcp_panel.setVisible(expanded)
-        self.mcp_toggle.setChecked(expanded)
-        self.mcp_toggle.setText('▼ Lokale KI (Ollama)' if expanded else '▶ Lokale KI (Ollama)')
+        expanded = (not self.ollama_dock.isVisible()) if checked is None else bool(checked)
+        self.ollama_dock.setVisible(expanded)
         self.settings['ollama_panel_collapsed'] = not expanded
         self.save_settings()
         if expanded and self.ollama_model.count() == 0:
             self.load_ollama_models()
+
+    def reset_dock_layout(self):
+        # Restore a practical default layout; all docks remain movable and floatable.
+        for dock in (self.palette_dock, self.file_explorer_dock, self.flipper_file_explorer_dock):
+            self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, dock)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.ollama_dock)
+        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.output_dock)
+        self.splitDockWidget(self.file_explorer_dock, self.flipper_file_explorer_dock, Qt.Orientation.Horizontal)
+        self.palette_dock.show()
+        self.output_dock.show()
+        self.flipper_file_explorer_dock.hide()
 
     def _ollama_api_url(self):
         return self.ollama_url.text().strip().rstrip('/')
@@ -1670,11 +1719,14 @@ class BadUSBIDE(QMainWindow):
         view=bar.addMenu("Ansicht")
         themes=view.addMenu("Theme")
         for name in THEMES: self.action(name,lambda checked=False,n=name:self.change_theme(n),themes)
-        self.action("Befehlspalette ein-/ausklappen",lambda:self.toggle_palette(not self.palette.isVisible()),view,"Ctrl+B")
+        self.action("Befehle ein-/ausblenden",lambda:self.palette_dock.setVisible(not self.palette_dock.isVisible()),view,"Ctrl+B")
         self.action("PC-Dateiexplorer ein-/ausblenden",lambda:self.file_explorer_dock.setVisible(not self.file_explorer_dock.isVisible()),view,"Ctrl+Shift+E")
         self.action("Flipper-Dateiexplorer ein-/ausblenden",lambda:self.flipper_file_explorer_dock.setVisible(not self.flipper_file_explorer_dock.isVisible()),view,"Ctrl+Shift+F")
         self.action("Einstellungen…",self.show_settings,view)
-        self.action("Lokale KI (Ollama) ein-/ausklappen",lambda:self.toggle_mcp_panel(not self.mcp_panel.isVisible()),view,"Ctrl+Alt+M")
+        self.action("Ollama ein-/ausblenden",lambda:self.ollama_dock.setVisible(not self.ollama_dock.isVisible()),view,"Ctrl+Alt+M")
+        self.action("Output ein-/ausblenden",lambda:self.output_dock.setVisible(not self.output_dock.isVisible()),view,"Ctrl+Shift+O")
+        view.addSeparator()
+        self.action("Fensteranordnung zurücksetzen",self.reset_dock_layout,view)
         self.action("Autovervollständigung anzeigen",lambda:self.current_editor() and self.current_editor().show_suggestions(True),view,"Ctrl+Space")
         helpm=bar.addMenu("Hilfe")
         self.action("Befehlsreferenz",self.show_js_sandbox,helpm)
@@ -3111,53 +3163,150 @@ class BadUSBIDE(QMainWindow):
                     table.setItem(r,1,QTableWidgetItem(desc))
         search.textChanged.connect(fill); table.cellDoubleClicked.connect(lambda r,c:self.current_editor() and self.current_editor().textCursor().insertText(table.item(r,0).text())); fill(); dlg.exec()
     def show_settings(self):
+        """Tabbed, extensible settings dialog with editor, UI, files and Ollama options."""
         dlg = QDialog(self)
         dlg.setWindowTitle('Einstellungen – BadUSB IDE')
-        dlg.resize(820, 760)
-        dlg.setMinimumSize(760, 680)
-        layout = QVBoxLayout(dlg)
-        layout.setContentsMargins(20, 18, 20, 18)
-        layout.setSpacing(14)
-        form = QFormLayout()
-        form.setHorizontalSpacing(22)
-        form.setVerticalSpacing(14)
-        layout.addLayout(form)
+        dlg.resize(940, 790)
+        dlg.setMinimumSize(820, 680)
+        outer = QVBoxLayout(dlg)
+        outer.setContentsMargins(16, 14, 16, 14)
+        outer.setSpacing(12)
+        tabs = QTabWidget()
+        outer.addWidget(tabs, 1)
+
+        def page(title):
+            w = QWidget()
+            lay = QVBoxLayout(w)
+            lay.setContentsMargins(18, 18, 18, 18)
+            lay.setSpacing(12)
+            form = QFormLayout()
+            form.setHorizontalSpacing(24)
+            form.setVerticalSpacing(12)
+            lay.addLayout(form)
+            lay.addStretch(1)
+            tabs.addTab(w, title)
+            return form
+
+        def checkbox(form, label, key, default, help_text=None):
+            c = QCheckBox(label)
+            c.setChecked(bool(self.settings.get(key, default)))
+            if help_text: c.setToolTip(help_text)
+            form.addRow(c)
+            return c
+
+        def spin(form, label, key, default, minimum, maximum, suffix=''):
+            c = QSpinBox(); c.setRange(minimum, maximum); c.setValue(int(self.settings.get(key, default))); c.setSuffix(suffix)
+            form.addRow(label, c)
+            return c
+
+        # Appearance
+        f = page('Darstellung')
         theme = QComboBox(); theme.addItems(THEMES); theme.setCurrentText(self.theme_name)
-        form.addRow('Farbschema', theme)
-        font_size = QSpinBox(); font_size.setRange(8, 28); font_size.setValue(int(self.settings.get('font_size', 11)))
-        form.addRow('Editor-Schriftgröße', font_size)
-        live = QCheckBox('Live-Syntaxprüfung beim Tippen'); live.setChecked(bool(self.settings.get('live_check', True)))
-        form.addRow('Prüfung', live)
-        autocomplete = QCheckBox('Autovervollständigung aktivieren'); autocomplete.setChecked(bool(self.settings.get('autocomplete', True)))
-        form.addRow('Vorschläge', autocomplete)
-        show_output = QCheckBox('Prüfergebnisfenster anzeigen'); show_output.setChecked(bool(self.settings.get('show_output', True)))
-        form.addRow('Ausgabe', show_output)
-        output_height = QSpinBox(); output_height.setRange(60, 600); output_height.setValue(int(self.settings.get('output_height', 130)))
-        form.addRow('Ausgabehöhe (px)', output_height)
-        confirm_close = QCheckBox('Vor dem Schließen nach ungespeicherten Änderungen fragen'); confirm_close.setChecked(bool(self.settings.get('confirm_before_close', True)))
-        form.addRow('Schließen', confirm_close)
-        remember_size = QCheckBox('Fenstergröße speichern'); remember_size.setChecked(bool(self.settings.get('remember_window_size', True)))
-        form.addRow('Fenster', remember_size)
+        f.addRow('Farbschema', theme)
+        font_family = QComboBox(); font_family.setEditable(True)
+        font_family.addItems(['Consolas', 'Cascadia Code', 'Cascadia Mono', 'JetBrains Mono', 'Fira Code', 'Source Code Pro', 'Courier New'])
+        font_family.setCurrentText(self.settings.get('font_family', 'Consolas'))
+        f.addRow('Editor-Schriftart', font_family)
+        font_size = spin(f, 'Editor-Schriftgröße', 'font_size', 11, 7, 36, ' pt')
+        ui_scale = spin(f, 'Zusätzliche UI-Schriftgröße', 'ui_font_size', 10, 8, 24, ' pt')
+        remember_size = checkbox(f, 'Fenstergröße und Dock-Anordnung speichern', 'remember_window_size', True)
+        show_status = checkbox(f, 'Statusleiste anzeigen', 'show_status_bar', True)
+        restore_docks = checkbox(f, 'Befehle beim Start anzeigen', 'show_commands', True)
+        show_ollama = checkbox(f, 'Ollama-Fenster beim Start anzeigen', 'show_ollama', False)
+        show_output = checkbox(f, 'Output-/Prüffenster beim Start anzeigen', 'show_output', True)
+        show_explorer = checkbox(f, 'Dateiexplorer beim Start anzeigen', 'show_file_explorer', True)
+
+        # Editor
+        f = page('Editor')
+        autocomplete = checkbox(f, 'Autovervollständigung aktivieren', 'autocomplete', True)
+        live = checkbox(f, 'Live-Syntaxprüfung beim Tippen', 'live_check', True)
+        word_wrap = checkbox(f, 'Zeilen automatisch umbrechen', 'word_wrap', False)
+        current_line = checkbox(f, 'Aktuelle Zeile hervorheben', 'highlight_current_line', True)
+        spaces = spin(f, 'Tabulatorbreite', 'tab_width', 4, 1, 16, ' Leerzeichen')
+        indent_spaces = checkbox(f, 'Tab-Taste als Leerzeichen einfügen', 'insert_spaces', True)
+        auto_pair = checkbox(f, 'Klammern und Anführungszeichen automatisch ergänzen', 'auto_pairs', False,
+                             'Wird gespeichert; automatische Ergänzung benötigt eine Editor-Erweiterung, falls sie nicht bereits aktiv ist.')
+        f.addRow(QLabel('Tipp: Für sehr lange Zeilen ist automatischer Umbruch meist besser ausgeschaltet.'))
+
+        # Output and checking
+        f = page('Prüfung & Output')
+        output_lines = spin(f, 'Maximale Output-Zeilen', 'output_max_blocks', 1500, 100, 50000, ' Zeilen')
+        output_height = spin(f, 'Start-Höhe des Output-Fensters', 'output_height', 180, 60, 1000, ' px')
+        live_debounce = spin(f, 'Verzögerung der Live-Prüfung', 'live_check_delay', 400, 100, 3000, ' ms')
+        clear_output = checkbox(f, 'Output vor einer neuen Prüfung leeren', 'clear_output_before_check', False)
+        f.addRow(QLabel('Die Fenstergröße kann zusätzlich jederzeit per Dock-Drag angepasst werden.'))
+
+        # Files
+        f = page('Dateien & Projekte')
         extension = QComboBox(); extension.addItems(['.txt', '.payload', '.ducky', '.js', '.mjs']); extension.setCurrentText(self.settings.get('default_extension', '.txt'))
-        form.addRow('Standard-Endung für neue Dateien', extension)
+        f.addRow('Standard-Endung für neue Dateien', extension)
         directory = QLineEdit(str(self.settings.get('last_directory') or Path.cwd()))
         browse = QPushButton('Durchsuchen…')
         row = QHBoxLayout(); row.addWidget(directory, 1); row.addWidget(browse)
-        form.addRow('Standard-Arbeitsverzeichnis', row)
+        f.addRow('Standard-Arbeitsverzeichnis', row)
         browse.clicked.connect(lambda: directory.setText(QFileDialog.getExistingDirectory(dlg, 'Arbeitsverzeichnis wählen', directory.text() or str(Path.cwd())) or directory.text()))
+        recent_count = spin(f, 'Anzahl zuletzt verwendeter Projektordner', 'recent_folder_limit', 20, 1, 100)
+        confirm_close = checkbox(f, 'Vor dem Schließen nach ungespeicherten Änderungen fragen', 'confirm_before_close', True)
+        ask_overwrite = checkbox(f, 'Vor dem Überschreiben bestehender Dateien nachfragen', 'confirm_overwrite', True)
+        reopen_files = checkbox(f, 'Zuletzt verwendeten Projektordner beim Start verwenden', 'restore_project_folder', True)
+
+        # Ollama
+        f = page('Ollama / KI')
+        ollama_url = QLineEdit(self.settings.get('ollama_url', 'http://localhost:11434'))
+        ollama_url.setPlaceholderText('http://192.168.x.x:11434')
+        f.addRow('API-Adresse', ollama_url)
+        ollama_model = QLineEdit(self.settings.get('ollama_model', ''))
+        ollama_model.setPlaceholderText('z. B. qwen2.5-coder:3b')
+        f.addRow('Bevorzugtes Modell', ollama_model)
+        ollama_include = checkbox(f, 'Editorinhalt standardmäßig mitsenden', 'ollama_include_editor', True)
+        ollama_timeout = spin(f, 'Timeout für KI-Anfragen', 'ollama_timeout', 90, 5, 600, ' Sekunden')
+        ollama_context = spin(f, 'Maximale Anzahl Zeichen des Editor-Kontexts', 'ollama_context_chars', 12000, 1000, 100000, ' Zeichen')
+        f.addRow(QLabel('Hinweis: Bei Ollama auf einem anderen Computer die LAN-IP und den API-Port verwenden.'))
+
+        # Device / advanced
+        f = page('Gerät & Erweitert')
+        serial_timeout = spin(f, 'Serieller Lese-Timeout', 'serial_timeout', 4, 1, 30, ' Sekunden')
+        serial_wait = spin(f, 'Wartezeit nach CLI-Befehlen', 'serial_wait_ms', 250, 0, 2000, ' ms')
+        max_file_size = spin(f, 'Warnschwelle für große Payloads', 'large_file_warning_kb', 256, 16, 10240, ' KB')
+        safe_mode = checkbox(f, 'Vor dem Senden einer Payload zusätzliche Bestätigung verlangen', 'confirm_before_send', True)
+        debug_log = checkbox(f, 'Zusätzliche Diagnosemeldungen aktivieren', 'debug_logging', False)
+        f.addRow(QLabel('Geräte-Timeouts und Diagnoseoptionen werden gespeichert. Nicht jede Option wird von jeder Firmware unterstützt.'))
+
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.RestoreDefaults)
-        for widget in (theme, font_size, live, autocomplete, show_output, output_height, confirm_close, remember_size, extension, directory, browse):
-            widget.setMinimumHeight(34)
-            if isinstance(widget, QLineEdit):
-                widget.setMinimumWidth(380)
         buttons.setMinimumHeight(42)
-        layout.addWidget(buttons)
-        buttons.button(QDialogButtonBox.StandardButton.RestoreDefaults).clicked.connect(lambda: (theme.setCurrentText('Flipper Amber'), font_size.setValue(11), live.setChecked(True), autocomplete.setChecked(True), show_output.setChecked(True), output_height.setValue(130), confirm_close.setChecked(True), remember_size.setChecked(True), extension.setCurrentText('.txt'), directory.setText(str(Path.cwd()))))
+        outer.addWidget(buttons)
+
+        def restore_defaults():
+            theme.setCurrentText('Flipper Amber'); font_family.setCurrentText('Consolas'); font_size.setValue(11); ui_scale.setValue(10)
+            remember_size.setChecked(True); show_status.setChecked(True); restore_docks.setChecked(True); show_ollama.setChecked(False); show_output.setChecked(True); show_explorer.setChecked(True)
+            autocomplete.setChecked(True); live.setChecked(True); word_wrap.setChecked(False); current_line.setChecked(True); spaces.setValue(4); indent_spaces.setChecked(True); auto_pair.setChecked(False)
+            output_lines.setValue(1500); output_height.setValue(180); live_debounce.setValue(400); clear_output.setChecked(False)
+            extension.setCurrentText('.txt'); directory.setText(str(Path.cwd())); recent_count.setValue(20); confirm_close.setChecked(True); ask_overwrite.setChecked(True); reopen_files.setChecked(True)
+            ollama_url.setText('http://localhost:11434'); ollama_model.clear(); ollama_include.setChecked(True); ollama_timeout.setValue(90); ollama_context.setValue(12000)
+            serial_timeout.setValue(4); serial_wait.setValue(250); max_file_size.setValue(256); safe_mode.setChecked(True); debug_log.setChecked(False)
+        buttons.button(QDialogButtonBox.StandardButton.RestoreDefaults).clicked.connect(restore_defaults)
         buttons.accepted.connect(dlg.accept); buttons.rejected.connect(dlg.reject)
+        for w in (theme, font_family, font_size, ui_scale, spaces, output_lines, output_height, live_debounce, extension, directory, recent_count, ollama_url, ollama_model, ollama_timeout, ollama_context, serial_timeout, serial_wait, max_file_size):
+            w.setMinimumHeight(32)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
+
         chosen_directory = directory.text().strip() or str(Path.cwd())
-        self.settings.update({'font_size': font_size.value(), 'live_check': live.isChecked(), 'autocomplete': autocomplete.isChecked(), 'show_output': show_output.isChecked(), 'output_height': output_height.value(), 'confirm_before_close': confirm_close.isChecked(), 'remember_window_size': remember_size.isChecked(), 'default_extension': extension.currentText(), 'last_directory': chosen_directory})
+        self.settings.update({
+            'font_size': font_size.value(), 'font_family': font_family.currentText().strip() or 'Consolas', 'ui_font_size': ui_scale.value(),
+            'live_check': live.isChecked(), 'autocomplete': autocomplete.isChecked(), 'word_wrap': word_wrap.isChecked(),
+            'highlight_current_line': current_line.isChecked(), 'tab_width': spaces.value(), 'insert_spaces': indent_spaces.isChecked(), 'auto_pairs': auto_pair.isChecked(),
+            'show_output': show_output.isChecked(), 'output_height': output_height.value(), 'output_max_blocks': output_lines.value(),
+            'live_check_delay': live_debounce.value(), 'clear_output_before_check': clear_output.isChecked(),
+            'confirm_before_close': confirm_close.isChecked(), 'confirm_overwrite': ask_overwrite.isChecked(), 'restore_project_folder': reopen_files.isChecked(),
+            'remember_window_size': remember_size.isChecked(), 'default_extension': extension.currentText(), 'last_directory': chosen_directory,
+            'recent_folder_limit': recent_count.value(), 'show_status_bar': show_status.isChecked(), 'show_commands': restore_docks.isChecked(),
+            'show_ollama': show_ollama.isChecked(), 'show_file_explorer': show_explorer.isChecked(),
+            'ollama_url': ollama_url.text().strip() or 'http://localhost:11434', 'ollama_model': ollama_model.text().strip(),
+            'ollama_include_editor': ollama_include.isChecked(), 'ollama_timeout': ollama_timeout.value(), 'ollama_context_chars': ollama_context.value(),
+            'serial_timeout': serial_timeout.value(), 'serial_wait_ms': serial_wait.value(), 'large_file_warning_kb': max_file_size.value(),
+            'confirm_before_send': safe_mode.isChecked(), 'debug_logging': debug_log.isChecked(),
+        })
         if Path(chosen_directory).expanduser().is_dir():
             self.settings['recent_project_folder'] = str(Path(chosen_directory).expanduser().resolve())
             self.settings['project_folder_explicit'] = True
