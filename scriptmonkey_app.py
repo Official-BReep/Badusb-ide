@@ -22,70 +22,9 @@ import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
 
-from PyQt6.QtCore import (
-    QUrl,
-    QRect,
-    QPoint,
-    QSize,
-    QStringListModel,
-    Qt,
-    QTimer,
-    QThread,
-    pyqtSignal,
-    QtMsgType,
-    qInstallMessageHandler,
-)
-from PyQt6.QtGui import (
-    QAction,
-    QColor,
-    QDesktopServices,
-    QFont,
-    QKeySequence,
-    QPainter,
-    QIcon,
-    QPixmap,
-    QSyntaxHighlighter,
-    QTextCharFormat,
-    QTextCursor,
-    QTextFormat,
-)
-from PyQt6.QtWidgets import (
-    QAbstractItemView,
-    QApplication,
-    QCheckBox,
-    QComboBox,
-    QCompleter,
-    QDialog,
-    QDialogButtonBox,
-    QDockWidget,
-    QFileDialog,
-    QFormLayout,
-    QFrame,
-    QHBoxLayout,
-    QInputDialog,
-    QLabel,
-    QLineEdit,
-    QListWidget,
-    QListWidgetItem,
-    QMainWindow,
-    QMenu,
-    QMessageBox,
-    QPlainTextEdit,
-    QProgressBar,
-    QPushButton,
-    QSpinBox,
-    QSplitter,
-    QStatusBar,
-    QTabWidget,
-    QTableWidget,
-    QTableWidgetItem,
-    QTextEdit,
-    QToolBar,
-    QTreeWidget,
-    QTreeWidgetItem,
-    QVBoxLayout,
-    QWidget,
-)
+from PyQt6.QtCore import *
+from PyQt6.QtGui import *
+from PyQt6.QtWidgets import *
 
 
 from scriptmonkey_diagnostics import _LOGGER, _log_runtime_event
