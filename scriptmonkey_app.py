@@ -27,7 +27,7 @@ from PyQt6.QtGui import *
 from PyQt6.QtWidgets import *
 
 
-from scriptmonkey_diagnostics import _LOGGER, _log_runtime_event
+from lib.scriptmonkey_diagnostics import _LOGGER, _log_runtime_event
 
 from lib.Ducky_Highlighter import DuckyHighlighter
 from lib.js_highlighter import JavaScriptHighlighter

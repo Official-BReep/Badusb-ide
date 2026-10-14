@@ -7,7 +7,7 @@ from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QAction, QFont, QIcon, QKeySequence
 from PyQt6.QtWidgets import *
 from dataclasses import dataclass
-from scriptmonkey_diagnostics import _LOGGER, _log_runtime_event
+from lib.scriptmonkey_diagnostics import _LOGGER, _log_runtime_event
 
 from lib.shared_data import (
     COMMANDS,

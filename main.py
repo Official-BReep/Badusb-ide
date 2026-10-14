@@ -1,5 +1,5 @@
 # ScriptMonkey launcher. Start this file, not scriptmonkey_app.py directly.
-from scriptmonkey_diagnostics import install_logging
+from lib.scriptmonkey_diagnostics import install_logging
 install_logging()
 from scriptmonkey_app import main
 
