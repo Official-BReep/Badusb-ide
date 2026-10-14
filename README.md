@@ -1,4 +1,4 @@
-# BadUSB IDE – Flipper Zero Payload Editor
+# ScriptMonkey – Flipper Zero Payload Editor
 
 Eine desktopbasierte IDE auf Basis von **Python und PyQt6** zum Schreiben, Bearbeiten und Prüfen von BadUSB-Payloads sowie JavaScript-/mJS-Skripten für den Flipper Zero. Die Anwendung bietet einen Code-Editor, Befehlsreferenzen, Dateiexplorer, optionale lokale KI-Unterstützung über Ollama und ein Plugin-System.
 
